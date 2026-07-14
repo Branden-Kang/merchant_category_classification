@@ -1,214 +1,282 @@
 # 가맹점 카테고리 분류 모델링 논문 / 산업 사례 비교 및 고도화 제안
 
-> 작성일: 2026-07-13  
-> 목적: 기존 ML 모델과 룰 기반 분류 로직을 보유하고 있으며, LLM 적용 효과가 확인된 상황에서 가맹점 카테고리 분류 모델을 어떤 방향으로 고도화할지 검토하기 위한 모델링 중심 리서치 문서
+> 작성일: 2026-07-14  
+> 목적: 2023년 2월 학습 이후 갱신되지 않았고 재학습 파이프라인도 유실된 기존 SubwordCNN/ML 모델을 전제로, **재현 가능한 신규 1차 분류 모델을 다시 구축하고 LLM을 기타·저신뢰 가맹점 재분류기로 결합하는 1개월 MVP**를 설계한다.
 
 ---
 
-## 0. 문서 범위
+## 0. 문서 범위와 핵심 결론
 
-본 문서는 **가맹점명, 거래 설명, 거래 패턴, 관계 정보, 기존 룰 결과, MCC 등을 이용한 가맹점 카테고리 분류 모델링**에 직접 또는 간접적으로 관련된 연구와 산업 사례를 정리한다.
+### 0.1 현재 상황
 
-다음 항목은 이미 별도 정비 계획이 있다고 가정하고 독립적인 우선순위 과제에서는 제외한다.
-
-- Rule / Dictionary / Merchant Normalization 정비
-- MCC / 내부 소비 카테고리 / 마케팅 카테고리 분리 및 taxonomy 정비
-
-다만 위 항목은 모델에서 제외되는 것이 아니라 다음과 같이 입력 피처, 후보 생성 신호, 학습 라벨 또는 운영 신호로 활용한다.
-
-| 항목 | 본 문서에서의 활용 방식 |
-|---|---|
-| Rule / Dictionary | `rule_category`, `rule_score`, `rule_type`, `rule_model_agreement`, hard-rule early exit, weak label |
-| Merchant Normalization | `clean_merchant_name`, `standard_merchant_name`, `brand_id`, 임베딩 검색 키, 중복 제거 키 |
-| MCC | `mcc`, `mcc_embedding`, `mcc_prior`, 후보 카테고리 제한, LLM 입력 근거 |
-| 내부 소비 / 마케팅 카테고리 | hierarchical 또는 multi-task output label |
-| 수기 라벨 | gold label, 유사 사례 검색 인덱스, hard-negative 구성, calibration 데이터 |
-
-본 문서의 핵심 문제는 다음과 같다.
+현재 가맹점 카테고리 분류 환경은 다음과 같이 정리된다.
 
 ```text
-입력:
-    가맹점명, 거래명, MCC, 룰 결과, 거래 패턴, 관계 정보
-
-출력:
-    계층형 카테고리
-    + confidence
-    + Top-K 후보
-    + 근거 및 유사 사례
-    + LLM/검수 필요 여부
+- 기존 SubwordCNN / ML 분류 모델은 2023년 2월 학습됨
+- 이후 신규 가맹점·브랜드·거래 표현 변화가 반영되지 않음
+- 최근 데이터에서 오분류가 다수 발생함
+- 담당자 변경·퇴사로 학습 코드, 데이터 생성 절차, 모델 배포 절차가 남아 있지 않음
+- 모델 재학습과 성능 재현이 어려움
+- LLM을 기타 가맹점 재분류에 적용했을 때 효과가 확인됨
+- 수기 정답 가맹점 데이터가 존재함
 ```
 
-### 0.1 논문 해석 시 주의사항
+이 조건에서는 기존 모델을 중심으로 LLM만 추가하는 방식이 적절하지 않다. 기존 모델의 성능과 데이터 적합성을 신뢰하기 어렵고, 재학습이 불가능해 향후 유지보수도 할 수 없기 때문이다.
 
-검토 논문들은 동일한 문제를 다루지 않는다. 따라서 논문에서 보고한 수치를 가맹점 카테고리 분류 성능으로 직접 해석하면 안 된다.
+### 0.2 최종 판단
 
-| 연구 유형 | 우리 문제와의 관련성 | 해석 방법 |
-|---|---:|---|
-| Product categorization | 높음 | 대규모 taxonomy와 Top-K 후보 재순위화 구조를 직접 참고 |
-| Bank transaction categorization | 높음 | 짧고 노이즈가 많은 거래명, 계층 분류, 약지도 학습을 참고 |
-| Merchant normalization / matching | 중간 | 모델 크기·비용·도메인 특화 학습의 근거로 활용 |
-| Transaction foundation model | 중간 | merchant/MCC 임베딩을 주 모델에 주입하는 방법을 참고 |
-| Personalized accounting category | 중간 | 사용자·기업별 관계와 graph/link prediction 구조를 참고 |
-| 외부 enrichment API | 간접 | 출력 스키마와 운영 형태를 참고 |
+권장 방향은 다음 두 작업을 **병렬로 추진**하는 것이다.
+
+```text
+Track A. 신규 1차 분류 모델과 재학습 파이프라인 재구축
+    - 데이터셋 생성
+    - 학습/평가 코드
+    - 모델 버전 관리
+    - 배치 추론
+    - 성능 모니터링
+
+Track B. LLM 재분류 모듈 구축
+    - 신규 1차 모델의 기타·저신뢰 결과 추출
+    - 임베딩 기반 후보 카테고리 검색
+    - 후보 제한형 LLM 재분류
+    - 자동 반영 / 검수 / 기타 유지 라우팅
+```
+
+1개월 안에 현실적으로 목표로 할 수 있는 결과는 **완전한 운영 전환이 아니라 재현 가능한 신규 모델과 shadow/backfill 가능한 통합 MVP**다.
+
+### 0.3 권장 최종 역할 분리
+
+| 구성요소 | 권장 역할 |
+|---|---|
+| Rule / Dictionary | 정확도가 검증된 항목의 early exit, 모델 feature, 충돌 탐지 |
+| 신규 1차 분류 모델 | 전체 가맹점의 기본 카테고리 예측과 Top-K 후보 생성 |
+| 임베딩 검색 | 유사 수기 정답 가맹점과 Category Label Card 검색 |
+| LLM | 기타·저신뢰·모델 충돌·신규 가맹점의 재분류 |
+| Human Review | 근거 부족, 고위험 카테고리, 모델 간 충돌 사례 확인 |
+| Feedback Store | 검수 정답과 고신뢰 결과를 다음 재학습 데이터로 축적 |
+| 기존 2023년 모델 | 신규 모델과 비교하기 위한 legacy baseline 또는 shadow 신호로만 사용 |
+
+### 0.4 이번 문서에서 제외하는 독립 과제
+
+다음 항목은 중요하지만 별도 정비 과제로 가정한다.
+
+- Rule / Dictionary / Merchant Normalization 자체 정비
+- MCC 체계와 내부 소비·마케팅 taxonomy 정비
+- 사용자·가맹점 관계 그래프 구축
+- 실시간 LLM serving
+
+단, 이 결과들은 신규 모델의 입력 feature와 운영 신호로 사용한다.
 
 ---
 
-## 1. 논문 / 산업 사례 비교표
+## 1. 논문 및 산업 사례 비교
 
 ### 1.1 연구 논문
 
-| 논문 | 문제 정의 | 데이터 / 입력 | 핵심 방법 | 주요 장점 | 주요 한계 | 우리 서비스 적용 포인트 |
-|---|---|---|---|---|---|---|
-| **Merchant Category Identification Using Credit Card Transactions** (2020) | 신고된 merchant business type의 타당성 식별 | 71,668 merchant, 대규모 고객 거래 관계 및 시계열 | temporal transaction encoder + merchant affinity encoder | 텍스트가 아닌 거래 패턴과 merchant 관계 활용 | 충분한 거래 로그와 affinity 구축 필요 | 이름이 모호한 가맹점에 거래 패턴·유사 가맹점 feature 추가 |
-| **Building Payment Classification Models from Rules and Crowdsourced Labels** (2018) | 룰 coverage 한계와 사용자 수정 라벨 활용 | 초기 룰, 결제 데이터, 사용자 수정 | 룰 bootstrap + 수정 라벨 기반 ML | 기존 룰을 학습 자산으로 전환 | 사용자 라벨 일관성 관리 필요 | 룰 결과를 feature, weak label, feedback label로 분리 |
-| **Scalable and Weakly Supervised Bank Transaction Classification** (2023) | 수기 라벨 부족 상황에서 확장 가능한 거래 분류 | transaction text, 시간·금액 패턴, heuristic | labeling functions + FastText anchoring + Snorkel label model + multimodal DNN | 라벨 부족 완화, 신규 분류 과제 확장 용이 | labeling function 의존성·확률 calibration 문제 | 룰/WordNet/MCC/LLM을 약지도 소스로 통합 |
-| **Two-headed DragoNet** (2023) | 금융 거래의 macro/micro 계층 분류 | merchant name + business activity | Transformer + Context Fusion + two heads + Taxonomy-aware Attention | 부모-자식 불일치 감소, 보조 설명 정보 활용 | merchant name만 사용할 때 성능이 크게 낮음 | 가맹점명 + 업종 설명/MCC/검색 문맥의 multi-input fusion 필요 |
-| **SVM Short-Text Classification** (2024) | 약어와 노이즈가 많은 짧은 거래 설명 분류 | 실제 거래 설명 corpus | short-text similarity detector + SVM | 낮은 비용, 강한 전통 baseline | 의미 일반화 제한 | char n-gram/SVM을 반드시 비교 baseline으로 유지 |
-| **E-commerce Product Categorization with LLM-based Dual-Expert** (2024) | 수천 개 taxonomy에서 세밀한 product category 선택 | product text, taxonomy path, category definitions | domain expert Top-K + LLM general expert reranking | long-tail·유사 카테고리·노이즈 라벨에 강점 | 2단계 추론 비용, product와 merchant 도메인 차이 | 임베딩/소형 모델이 Top-K 생성 후 LLM이 후보만 비교 |
-| **Transaction Categorization with Relational Deep Learning in QuickBooks** (2025) | personalized accounting category 예측 | transaction, category, code, company 관계형 DB | custom Txn-Bert + Top-K NN + heterogeneous GNN link prediction | 반복 거래 early exit, cold-start 및 unseen 보완 | graph pipeline 복잡성, 개인화 category와 우리 taxonomy 차이 | 수기 정답 유사 사례 검색 + graph 확장 구조에 참고 |
-| **Categorising SME Bank Transactions with Synthetic Data** (2025) | 비표준 거래명, 데이터 부족, 불균형 | SME transaction + synthetic data | synthetic generation + fine-tuned classifier + calibration | high-confidence 구간의 운영 가능성 제시 | synthetic 품질과 분포 왜곡 위험 | 소수 카테고리·신규 패턴 augmentation에 제한적으로 활용 |
-| **Better with Less** (2025) | raw transaction에서 merchant name 이해·매칭 | rule/ESD/raw transaction, 7.8M merchant 후보 | encoder/decoder/encoder-decoder 계열의 LLM과 proprietary small model 비교 | 작은 도메인 모델의 비용·속도 우위, 대규모 배포 사례 | merchant matching 과제이며 category 분류 직접 증거는 아님 | LLM 결과를 소형 Transformer로 이전하는 근거 |
-| **Enhancing Foundation Models... with LLM-based Sentence Embeddings** (2025) | transaction foundation model의 categorical index embedding 의미 손실 | MCC, merchant, location, transaction sequences | 다중 소스 정보 보강 + LLM sentence embedding offline initialization | 런타임 LLM 비용 없이 의미 정보 주입 | static embedding, category classification 직접 실험 아님 | Label Card/MCC/brand embedding 초기화 및 lightweight model 학습 |
+| 논문 | 문제 정의 | 데이터 | 방법 | 장점 | 한계 | 적용 포인트 | 링크 |
+|---|---|---|---|---|---|---|---|
+| **Merchant Category Identification Using Credit Card Transactions** (2020) | 가맹점이 신고한 business type 또는 merchant category가 실제 거래 행동과 일치하는지 식별 | 실제 대규모 신용카드 거래 데이터. 71,668개 가맹점과 고객·가맹점 거래 관계 및 시계열 사용 | Temporal transaction encoder와 merchant–merchant affinity encoder를 결합한 multi-modal learning | 가맹점명만으로 판단하기 어려운 업종을 거래 시간 패턴과 유사 가맹점 관계로 보완 | 충분한 거래 이력이 필요하고 신규 가맹점 cold-start에는 약함 | 1개월 이후 이름만으로 해결되지 않는 오분류에 거래 패턴·merchant affinity feature를 추가할 근거 | [arXiv](https://arxiv.org/abs/2011.02602) |
+| **Building Payment Classification Models from Rules and Crowdsourced Labels: A Case Study** (2018) | 룰 기반 payment classification의 coverage 한계와 사용자 수정 라벨을 이용한 bootstrapping 문제 해결 | 익명화된 금융기관 wire transfer·card payment 데이터, 초기 룰, 사용자 수정 라벨, 66개 카테고리 | 초기 룰로 분류기를 bootstrap하고 사용자 수정 라벨과 함께 ML 모델을 학습 | 기존 룰과 사용자 수정 결과를 버리지 않고 학습 자산으로 전환 | 사용자 라벨의 일관성·편향·노이즈 관리 필요 | 기존 룰 결과와 수기 수정 데이터를 신규 학습 데이터 및 confidence feature로 전환하고, LLM·검수 결과를 재학습에 누적 | [Springer](https://link.springer.com/chapter/10.1007/978-3-319-92898-2_7), [PDF](https://lepo.it.da.ut.ee/~dumas/pubs/caise2018PaymentClassification.pdf) |
+| **Scalable and Weakly Supervised Bank Transaction Classification** (2023) | 수작업 라벨이 부족한 은행 거래 데이터를 확장 가능하게 분류 | 거래 설명, 시간·금액 feature, 휴리스틱과 도메인 지식으로 만든 weak label | FastText 기반 anchoring, labeling functions, label model, multimodal neural classifier | 룰·휴리스틱을 대규모 학습 데이터 생성 파이프라인으로 연결 가능 | labeling function 품질과 상관관계에 민감하고 weak-label 확률이 실제 정확도와 다를 수 있음 | 1개월에는 label source와 confidence를 저장하는 스키마를 먼저 만들고, 이후 gold+weak label 혼합 학습으로 확장 | [arXiv](https://arxiv.org/abs/2305.18430) |
+| **Hierarchical Classification of Financial Transactions Through Context-Fusion of Transformer-based Embeddings and Taxonomy-aware Attention Layer** (2023) | 금융 거래를 macro·micro category로 동시에 분류하면서 계층 불일치를 줄이는 문제 | Card 및 current-account 데이터의 merchant name과 business activity 텍스트 | Transformer encoder, Context Fusion, macro/micro two-head classifier, Taxonomy-aware Attention Layer | 짧은 merchant text와 업종 설명을 결합하고 부모·자식 카테고리 불일치를 줄임 | taxonomy 품질이 중요하며 입력 문맥이 부족하면 효과가 제한될 수 있음 | 신규 1차 모델의 향후 hierarchical multi-head 확장 근거. 1개월에는 유효 category path 검증과 Top-K masking으로 단순 적용 | [arXiv](https://arxiv.org/abs/2312.07730) |
+| **Identifying Banking Transaction Descriptions via Support Vector Machine Short-Text Classification Based on a Specialized Labelled Corpus** (2024) | 약어와 정보 부족이 많은 은행 거래 설명을 낮은 비용으로 분류 | 실제 고객 거래 설명으로 구성된 전문 라벨 corpus | Short-text similarity detector와 SVM을 결합한 2단계 분류 | 짧은 문자열에서는 char/word n-gram과 SVM이 강한 저비용 baseline이 될 수 있음 | 의미 일반화와 복잡한 카테고리 경계 이해에는 제한 | 재구축 첫 모델로 char n-gram + Logistic Regression/Linear SVM을 반드시 구현해 빠른 성능 기준과 fallback을 확보 | [arXiv](https://arxiv.org/abs/2404.08664) |
+| **E-commerce Product Categorization with LLM-based Dual-Expert Classification Paradigm** (2024) | 수천 개의 세밀한 e-commerce taxonomy에서 정확한 상품 카테고리를 선택 | 대규모 상품 텍스트, 계층 taxonomy path, 카테고리 정의 | Fine-tuned domain expert가 Top-K 후보를 생성하고 범용 LLM expert가 후보를 재순위화 | LLM이 전체 taxonomy를 자유 탐색하지 않고 유사 후보 간 미세한 차이를 비교 | 상품 설명보다 가맹점명이 훨씬 짧고 2단계 추론 비용이 발생 | 신규 1차 모델·임베딩이 Top-K 후보를 만들고 LLM이 기타·저신뢰 건을 후보 안에서 재분류하는 핵심 근거 | [Amazon Science](https://www.amazon.science/publications/e-commerce-product-categorization-with-llm-based-dual-expert-classification-paradigm) |
+| **Transaction Categorization with Relational Deep Learning in QuickBooks** (2025) | QuickBooks 거래 카테고리화를 관계형 데이터베이스 위의 link prediction 문제로 재정의 | 거래, 기업, 계정·카테고리 코드, 과거 분류 이력이 연결된 관계형 데이터 | Txn-BERT, Top-K nearest-neighbor early exit, heterogeneous GNN link prediction | 반복 거래는 최근접 사례로 빠르게 처리하고 관계 정보로 unseen category와 cold-start를 보완 | graph schema와 학습·서빙 파이프라인 복잡도가 높음 | 1개월에는 nearest-neighbor early exit와 유사 정답 검색만 적용하고 GNN은 잔여 오류 분석 후 판단 | [arXiv](https://arxiv.org/abs/2506.09234) |
+| **Categorising SME Bank Transactions with Machine Learning and Synthetic Data Generation** (2025) | SME 거래 설명의 비표준성, 라벨 부족, 클래스 불균형 해결 | SME bank transaction 데이터와 synthetic transaction 데이터 | Synthetic data generation, fine-tuned classifier, confidence calibration | 라벨 부족·불균형을 보완하고 고신뢰 자동 처리 구간을 분리 | 합성 데이터가 실제 분포를 왜곡할 수 있고 calibration 성능에 민감 | 신규 모델 평가 후 소수 카테고리 데이터 부족이 명확할 때만 제한적으로 적용 | [arXiv](https://arxiv.org/abs/2508.05425) |
+| **Better with Less: Small Proprietary Models Surpass Large Language Models in Financial Transaction Understanding** (2025) | 금융 거래 문자열 이해에서 범용 대형 모델과 도메인 특화 소형 모델의 성능·속도·비용 비교 | Raw transaction descriptions와 대규모 merchant 후보를 이용한 merchant understanding·matching 과제 | 소형 도메인 Transformer와 encoder/decoder 계열 대형 모델 비교 | 제한된 거래 도메인에서는 작은 전용 모델이 대형 범용 모델보다 비용·속도·성능 면에서 유리할 수 있음을 제시 | 가맹점 카테고리 분류를 직접 평가한 연구는 아님 | 전체 가맹점을 LLM으로 처리하지 않고 신규 경량 1차 모델을 개발하며 LLM은 재분류에만 사용하는 근거 | [arXiv](https://arxiv.org/abs/2509.25803) |
+| **Enhancing Foundation Models in Transaction Understanding with LLM-based Sentence Embeddings** (2025) | Transaction foundation model에서 merchant·MCC·location 같은 categorical index가 의미 정보를 잃는 문제 | Payment-network transaction sequence와 merchant, MCC, location 등 categorical field | 외부 문맥으로 categorical entity 설명을 보강하고 LLM sentence embedding을 오프라인 생성해 초기 표현에 주입 | 온라인 LLM 호출 없이 merchant·MCC 의미 정보를 경량 모델에 전달 | 정적 임베딩 갱신 문제가 있고 가맹점 분류 직접 실험은 아님 | 1개월에는 Label Card·merchant retrieval에 적용하고, 이후 category/MCC embedding 초기화에 활용 | [ACL Anthology](https://aclanthology.org/2025.emnlp-industry.61/) |
 
 ### 1.2 산업 사례
 
-| 사례 | 제공 기능 | 모델링 관점의 시사점 | 주의점 |
-|---|---|---|---|
-| **Plaid Enrich** | merchant, category, location, counterparty 등 enrichment | category 단일 출력보다 merchant metadata와 confidence를 함께 제공 | 외부 taxonomy와 내부 taxonomy mapping 필요 |
-| **Yodlee Transaction Data Enrichment** | simple description, merchant name, category, geolocation | 정제 merchant name을 중간 산출물로 관리 | proprietary system이므로 내부 재학습 불가 |
-| **Salt Edge Data Enrichment** | personal/business category, merchant identification, user-defined category | 개인·법인·마케팅 taxonomy를 multi-task로 분리 가능 | taxonomy mapping과 사용자 수정 처리 필요 |
-| **QuickBooks production systems** | 기업별 거래 category 추천 | global model + company history + Top-K 추천의 조합 | 개인화 회계 category와 소비 category는 목적이 다름 |
+| 사례 | 문제 정의 | 데이터 | 방법 | 장점 | 한계 | 적용 포인트 | 링크 |
+|---|---|---|---|---|---|---|---|
+| **Plaid Enrich** | 비정형 transaction description을 정제하고 merchant·category·location·counterparty 정보로 보강 | Raw description, amount, account type, location 등 카드·은행 거래 입력 | Proprietary transaction enrichment와 merchant identification·categorization API | 카테고리뿐 아니라 표준화 merchant와 부가정보를 함께 제공 | 외부 taxonomy와 내부 taxonomy 차이, API 비용·보안·벤더 종속성 | 신규 시스템 출력도 `normalized merchant + category + confidence + evidence + model version`을 함께 제공 | [Product](https://plaid.com/products/enrich/), [API](https://plaid.com/docs/api/products/enrich/) |
+| **Yodlee Transaction Data Enrichment** | 이해하기 어려운 금융 거래 설명을 merchant name·category·geolocation으로 보강 | Bank/card transaction 데이터. Retail 및 business account transaction 지원 | Proprietary ML engine 기반 simple description, merchant, category, geolocation enrichment | 거래 설명 정제와 카테고리화를 하나의 enrichment 흐름으로 제공 | 모델과 taxonomy가 비공개이고 내부 taxonomy로 재학습하기 어려움 | 분류 결과뿐 아니라 정규화명과 category path를 함께 저장하고 소비·사업자 taxonomy를 분리 관리 | [Overview](https://developer.yodlee.com/resources/yodlee/transaction-data-enrichment/docs), [Retail](https://developer.yodlee.com/resources/yodlee/transaction-data-enrichment/docs/retail-category), [Business](https://developer.yodlee.com/resources/yodlee/transaction-data-enrichment/docs/business-category) |
+| **Salt Edge Data Enrichment** | Raw personal·business transaction을 카테고리와 merchant 정보로 변환 | Open-banking 등 다양한 transaction source의 raw description과 거래 정보 | Self-learning categorization, merchant identification, user-defined category 학습 API | 개인·사업자 카테고리와 사용자 정의 category를 지원 | 외부 category mapping과 결과 검증 체계를 사용자가 설계해야 함 | 검수·사용자 수정 결과를 feedback table에 저장하고 다음 재학습에 반영하는 구조의 산업적 근거 | [Product](https://www.saltedge.com/products/data_enrichment), [Docs](https://docs.saltedge.com/data_enrichment/v5/) |
+| **QuickBooks AI-powered Banking and Transaction Categorization** | 은행 거래를 기존 장부와 match하거나 적합한 회계 category를 추천하고 고신뢰 항목을 빠르게 처리 | Full bank description, vendor 정보, 과거 transaction history와 수정 이력 | 과거 분류 이력·거래 상세를 이용한 AI suggestion, high-confidence ready-to-post, 사용자 feedback | 고신뢰 자동 처리와 검토 대상을 분리하고 반복 거래·사용자 이력을 활용 | 개인화된 회계 category 문제로 일반 소비 업종 분류와 차이가 있음 | `자동 확정 + LLM 재분류 + 검수 + 수정 이력 재학습`으로 운영 구간을 분리할 근거 | [AI Banking](https://quickbooks.intuit.com/learn-support/en-us/help-article/matching-rules/learn-updates-new-ai-powered-banking-page/L0hR7A9Zf_US_en_US), [Category Suggestions](https://quickbooks.intuit.com/learn-support/en-global/help-article/bank-transactions/ai-suggestions-help-match-categorise-bank/L8FHOh4AD_ROW_en) |
 
 ---
 
-## 2. 가맹점 카테고리 분류 모델링 기술 카테고리 정리
+## 2. 기존 모델 상태가 설계에 미치는 영향
 
-가맹점 카테고리 분류 모델링은 입력 데이터와 운영 역할을 기준으로 다음 10개 영역으로 정리할 수 있다.
+### 2.1 기존 모델을 primary classifier로 유지하면 안 되는 이유
 
 ```text
-1. Short-text / Subword / Domain-specific Small Transformer
-2. Embedding Retrieval / Semantic Initialization
-3. Dual-Expert LLM Reranking
-4. Text & Tabular Context Fusion
-5. Hierarchical Multi-head / Taxonomy Constraint
-6. Weak Supervision / Label Generation
-7. Transaction Pattern / Time-series
-8. Merchant Affinity / Relational Graph
-9. Synthetic Data / LLM Teacher / Distillation
-10. Confidence-based Routing and Human Review
+1. 학습 시점이 2023년 2월로 오래되어 현재 상호·브랜드 분포와 차이가 큼
+2. 오분류가 많이 발생하고 있으나 원인을 재현할 학습·평가 코드가 없음
+3. 동일 데이터에서 재학습하거나 threshold를 조정할 수 없음
+4. feature·label·taxonomy 버전을 추적하기 어려움
+5. 담당자 의존적인 운영이 반복될 가능성이 큼
 ```
+
+따라서 기존 모델은 다음 용도로만 사용한다.
+
+- 동일 평가셋에서 신규 모델과 비교하는 legacy baseline
+- 기존 예측 결과와 신규 모델의 disagreement 분석
+- 과거 결과 호환성이 필요한 경우에만 shadow output 저장
+- 학습 코드나 weight가 남아 있더라도 신규 파이프라인의 필수 구성요소로 사용하지 않음
+
+### 2.2 신규 개발의 첫 번째 산출물은 모델이 아니라 파이프라인
+
+모델 정확도가 높아도 다음 항목이 없으면 다시 같은 문제가 발생한다.
+
+```text
+- 데이터 추출 SQL과 snapshot 기준
+- merchant 단위 중복 제거 기준
+- label source와 label priority
+- train / validation / test split 코드
+- feature 생성 코드
+- 학습 configuration
+- 평가 및 오류 분석 코드
+- model artifact와 metadata 저장
+- batch inference 코드
+- model / taxonomy / prompt version 관리
+- monitoring과 retraining 절차
+```
+
+신규 모델 개발의 완료 기준은 단순히 weight 파일을 만드는 것이 아니라 **다른 담당자가 동일 버전의 데이터를 이용해 동일 결과를 재현할 수 있는가**다.
 
 ---
 
-### 2.1 Short-text / Subword / Domain-specific Small Transformer
+## 3. 권장 기술 구성
 
-#### 문제 특성
+### 3.1 기술 영역별 적용 판단
 
-가맹점명과 거래 설명은 자연어 문장과 다르게 짧고, 약어·숫자·지점명·PG 표기·잘린 문자열이 많다.
+| 기술 영역 | 1개월 적용 여부 | 판단 |
+|---|---:|---|
+| 데이터셋·학습 파이프라인 재구축 | 필수 | 신규 모델 개발보다 먼저 완료해야 함 |
+| Char n-gram + Logistic Regression / Linear SVM | 필수 | 짧은 가맹점명에 강하고 빠르게 재현 가능한 기준 모델 |
+| Text + MCC / Rule / Tabular Feature Fusion | 필수 또는 우선 | 이름만으로 모호한 사례를 보완하는 현실적 주 모델 후보 |
+| 경량 Transformer fine-tuning | 병렬 challenger | 성능 향상 가능성이 높으나 1개월 내 안정화 여부를 평가해야 함 |
+| Hierarchical constraint | 부분 적용 | category path masking과 출력 검증부터 적용 |
+| Embedding retrieval | 필수 | LLM에 전달할 Top-K 후보와 유사 정답 사례 생성 |
+| LLM reclassification | 필수 | 기타·저신뢰·충돌·신규 가맹점에 한정 |
+| Confidence calibration / routing | 필수 | 자동 확정·재분류·검수 구간 분리 |
+| Weak supervision | 후속 | 룰·LLM·검수 라벨이 축적된 후 적용 |
+| Transaction time-series / graph | 후속 | 1개월 결과의 잔여 오류가 이름 정보 부족인지 확인 후 판단 |
+| Synthetic data | 선택적 후속 | 소수 category 부족이 확인될 때 제한 적용 |
 
-```text
-STARBUCKS 1234 SEOUL
-SBUX GANGNAM
-NAVERPAY SMARTSTORE
-COUPANGPAYMENTS
-ABC1234
-OO상사
-```
+### 3.2 신규 1차 분류 모델 후보
 
-따라서 범용 LLM의 지식만으로 처리하기보다 거래 문자열의 고유한 표기 규칙을 직접 학습하는 모델이 필요하다.
-
-#### 비교할 모델
-
-```text
-A. char n-gram + Linear SVM
-B. char n-gram + Logistic Regression
-C. fastText
-D. 기존 SubwordCNN
-E. DistilBERT / MiniLM 계열 fine-tuning
-F. 4~6 layer domain-specific Transformer
-G. LLM pseudo-label로 학습한 student model
-```
-
-**Better with Less**는 merchant matching 과제에서 1.5M~11M parameter의 도메인 특화 Transformer가 대형 pretrained model과 유사하거나 더 높은 성능을 보일 수 있음을 제시한다. **QuickBooks Rel-Cat**도 거래 문자열에 맞춘 tokenizer와 6-layer Txn-Bert를 학습했으며, 더 큰 12-layer 모델만이 항상 필요한 것은 아니라는 결과를 보고한다. 두 연구는 가맹점명과 거래 설명이 일반 자연어와 다른 표기 체계를 가지므로, 범용 대형 모델과 함께 작은 도메인 특화 모델을 독립적인 핵심 후보로 평가해야 한다는 근거를 제공한다.
-
-#### 추천 입력
-
-| 입력 | 설명 |
-|---|---|
-| `raw_merchant_name` | 원천 문자열 보존 |
-| `clean_merchant_name` | 노이즈 제거 문자열 |
-| `standard_merchant_name` | 정규화된 브랜드 또는 사업자명 |
-| `raw_transaction_description` | 거래 설명 원문 |
-| `token_pattern` | 영문/숫자/한글/특수문자 패턴 |
-| `mcc` | MCC categorical input |
-| `rule_category`, `rule_score` | 룰 결과와 강도 |
-| `brand_id` | 알려진 브랜드 식별자 |
-
-#### 권장 판단
-
-기존 SubwordCNN을 바로 교체하기보다 다음을 동일 데이터에서 비교한다.
+#### 모델 A: Char n-gram TF-IDF + Logistic Regression 또는 Linear SVM
 
 ```text
-SubwordCNN
-vs. char n-gram SVM
-vs. DistilBERT
-vs. 4~6 layer custom Transformer
+입력:
+- raw_merchant_name
+- normalized_merchant_name
+- raw_transaction_description(optional)
+
+특징:
+- character n-gram
+- word n-gram
+- 영문·숫자·한글 혼합 토큰
 ```
 
-대규모 운영에서는 모델 크기보다 다음 지표를 함께 봐야 한다.
+장점:
+
+- 학습과 추론이 빠름
+- 오타, 띄어쓰기, 지점명, 약어에 강함
+- 학습 코드와 feature를 재현하기 쉬움
+- 대량 batch 처리 비용이 낮음
+- 1개월 안에 반드시 확보 가능한 안전한 baseline
+
+한계:
+
+- 의미적으로 새로운 브랜드에 대한 일반화가 약함
+- 이름만으로 업종이 드러나지 않는 가맹점에 한계
+- 복잡한 hierarchy와 거래 문맥을 직접 학습하기 어려움
+
+#### 모델 B: Text Probability + Tabular Feature Fusion
+
+권장 초기 구조는 다음과 같다.
 
 ```text
-Macro-F1
-Long-tail F1
-New merchant accuracy
-1M건 추론 시간
-1M건 GPU/CPU 비용
-모델 업데이트 및 인덱스 재구축 비용
+Text Model:
+    char n-gram classifier 또는 경량 Transformer
+        → category probability / text embedding
+
+Tabular Features:
+    MCC
+    rule_category / rule_score
+    online_offline_flag
+    PG / marketplace flag
+    거래 금액·시간대·반복성 feature(optional)
+
+Fusion Model:
+    LightGBM / CatBoost / MLP
+        → final category probability
 ```
 
----
-
-### 2.2 Embedding Retrieval / Semantic Initialization
-
-임베딩의 역할은 두 가지로 구분해야 한다.
+1개월 내 transaction aggregation feature 생성이 어렵다면 다음 최소 feature로 시작한다.
 
 ```text
-역할 A: 유사 정답 가맹점과 후보 카테고리를 검색
-역할 B: LLM의 의미 지식을 경량 모델의 embedding layer 초기값으로 주입
+- raw / normalized merchant name
+- MCC
+- rule category
+- rule confidence
+- WordNet 또는 lexical similarity score
+- brand / chain flag
+- online / offline / PG flag
 ```
 
-#### 2.2.1 검색용 임베딩
+#### 모델 C: 경량 Transformer Challenger
 
-수기 라벨된 가맹점을 임베딩 인덱스로 만들고 신규 가맹점과 유사한 사례를 검색한다.
+후보 예시는 multilingual DistilBERT 계열 또는 내부 인프라에서 안정적으로 fine-tuning 가능한 encoder model이다.
 
 ```text
-입력 가맹점
-    ↓
-Dense embedding search
-    + lexical / char similarity
-    + brand / MCC filter
-    ↓
-유사 수기 정답 Top-N
-    ↓
-카테고리별 점수 집계
-    ↓
-후보 카테고리 Top-K
+Input text:
+[RAW] 원본 가맹점명
+[NORM] 정규화 가맹점명
+[MCC] MCC 설명
+[RULE] 룰 후보 category
 ```
 
-권장 인덱스는 2개다.
+권장 운영 방식:
 
-| 인덱스 | 내용 | 목적 |
-|---|---|---|
-| Merchant Reference Index | 수기 정답 가맹점명, 정규화명, 브랜드, category | 유사 정답 사례 검색 |
-| Category Label Card Index | category name, taxonomy path, 정의, 포함·제외, 대표 예시 | 후보 category semantic retrieval |
+- 모델 A/B와 동일한 split에서 비교
+- 전체 정확도만 보지 않고 Macro-F1, long-tail F1, new merchant 성능 비교
+- 학습·추론 비용과 배치 처리량을 함께 비교
+- 4주차에 안정화되지 않으면 challenger로 남기고 모델 A/B를 MVP champion으로 사용
 
-#### Label Card 예시
+### 3.3 Hierarchical Classification의 1개월 적용 방식
+
+1개월 안에 복잡한 taxonomy-aware multi-head 모델을 필수로 만들지는 않는다. 대신 다음을 적용한다.
+
+```text
+- leaf category별 parent path 저장
+- 모델의 Top-K 결과를 valid taxonomy path로 변환
+- 불가능한 parent-child 조합 제거
+- LLM에는 category_id가 아니라 category path와 정의를 제공
+- 평가 시 major / middle / minor 수준을 각각 계산
+```
+
+taxonomy가 안정적이고 label 수가 충분하면 이후 shared encoder + multi-head 구조로 확장한다.
+
+### 3.4 임베딩 검색
+
+임베딩은 신규 1차 모델을 대체하지 않고, **LLM 재분류 후보 생성기**로 사용한다.
+
+#### Merchant Reference Index
+
+```yaml
+reference_id: string
+raw_merchant_name: string
+normalized_merchant_name: string
+brand_id: string | null
+category_id: string
+category_path: string
+label_source: human | verified_rule | reviewed_llm
+label_version: string
+review_status: string
+```
+
+#### Category Label Card Index
 
 ```yaml
 category_id: C102
 category_name: 단체급식
-taxonomy_path: 식음료 > 급식 > 단체급식
-definition: 기업, 학교, 병원 등의 구내식당을 운영하거나 다수 인원에게 식사를 제공하는 업종
+category_path: 식음료 > 급식 > 단체급식
+definition: 기업·학교·병원 등의 구내식당을 운영하거나 다수 인원에게 식사를 제공하는 업종
 include:
   - 위탁급식
   - 사내식당
@@ -224,1124 +292,806 @@ confusable_categories:
   - 식자재 유통
 ```
 
-#### 검색 점수 예시
+#### Hybrid Candidate Score
 
 ```text
-retrieval_score(category) =
-    0.35 × max_reference_similarity
-  + 0.20 × top3_reference_mean
-  + 0.20 × category_card_similarity
-  + 0.15 × lexical_similarity
-  + 0.10 × neighbor_support_ratio
-```
-
-가중치는 예시이며 validation set으로 학습하거나 조정한다.
-
-#### Hybrid Retrieval 권장
-
-가맹점명은 매우 짧으므로 dense embedding만 사용하면 중요한 표면 문자열이 약화될 수 있다.
-
-```text
-Dense semantic score
-    + char n-gram / BM25 score
-    + exact brand match
-    + MCC prior
-    + rule score
-```
-
-최종 후보 생성기는 Logistic Regression 또는 LightGBM으로 결합할 수 있다.
-
-#### 2.2.2 LLM 기반 Semantic Initialization
-
-**Enhancing Foundation Models in Transaction Understanding with LLM-based Sentence Embeddings**는 merchant, MCC, location 정보를 외부 문맥으로 보강한 뒤 LLM 임베딩을 오프라인 생성하여 경량 foundation model의 embedding layer 초기값으로 사용한다.
-
-우리 서비스에서는 다음 실험이 가능하다.
-
-```text
-Category Card / Merchant Brand / MCC 설명
-    ↓
-LLM sentence embedding 오프라인 생성
-    ↓
-경량 Transformer의 category / merchant / MCC embedding 초기화
-    ↓
-내부 라벨로 task-specific fine-tuning
-```
-
-비교군:
-
-```text
-A. random initialization
-B. 일반 sentence embedding initialization
-C. LLM-generated semantic initialization
-D. LLM initialization + trainable
-E. LLM initialization + frozen
-```
-
-장점:
-
-- 온라인 LLM 호출 없이 의미 지식 활용
-- category label이 적은 long-tail에서 초기 표현 개선 가능
-- MCC 코드의 숫자형 index embedding보다 의미 정보가 풍부함
-
-주의점:
-
-- 정적 임베딩은 신규 브랜드와 의미 변화 반영이 느림
-- LLM 임베딩이 항상 분류 친화적이라는 보장은 없음
-- 주기적 재생성 또는 fine-tuning이 필요
-
-#### 임베딩 평가 지표
-
-| 지표 | 의미 |
-|---|---|
-| `Recall@3/5/10` | 정답 category가 후보에 포함되는 비율 |
-| `MRR` | 정답 후보의 평균 순위 |
-| `Neighbor Purity` | 상위 이웃의 category 일관성 |
-| `Candidate Miss Rate` | LLM 후보 목록에 정답이 없는 비율 |
-| `New Merchant Recall@K` | 신규 가맹점에서 후보 생성 성능 |
-| `Long-tail Recall@K` | 소수 category 후보 회수 성능 |
-
-임베딩 단계의 목표는 Top-1 accuracy보다 **Recall@K를 높이는 것**이다.
-
----
-
-### 2.3 Dual-Expert LLM Reranking
-
-LLM 적용 효과가 이미 확인되었다면 가장 우선적으로 검토할 구조다.
-
-#### Amazon Dual-Expert 구조
-
-```text
-Domain Expert
-    - 도메인 데이터로 fine-tuning
-    - Top-K candidate category 생성
-
-General Expert
-    - LLM
-    - 후보별 미묘한 차이 비교
-    - 최종 category 선택 및 이유 생성
-```
-
-Amazon 연구에서는 Domain Expert가 K=10 후보를 생성하고, LLM이 taxonomy path 및 LLM이 요약한 category definition을 이용해 최종 후보를 선택했다.
-
-#### 우리 서비스에 맞춘 구조
-
-```text
-[Rule / Dictionary]
-        ↓
-[Small Domain Classifier]
-        +
-[Embedding Retriever]
-        +
-[MCC / Transaction Prior]
-        ↓
-[Candidate Fusion: Top-3~Top-10]
-        ↓
-[LLM General Expert]
-        ↓
-[Confidence / Conflict Checker]
-```
-
-Domain Expert는 단일 모델일 필요가 없다.
-
-```text
-Domain Expert =
-    SubwordCNN probability
-  + domain Transformer probability
-  + embedding category score
-  + rule score
+candidate_score(category) =
+    dense merchant similarity
+  + category Label Card similarity
+  + char n-gram / lexical similarity
+  + new primary model probability
   + MCC prior
+  + soft rule score
 ```
 
-#### LLM 입력 예시
+초기에는 정규화된 가중합으로 시작하고, 검증 라벨이 충분해지면 Logistic Regression 또는 LightGBM으로 결합 점수를 학습한다.
 
-```json
-{
-  "merchant": {
-    "raw_name": "삼성웰스토리 판교구내식당",
-    "normalized_name": "삼성웰스토리",
-    "mcc": "...",
-    "rule_evidence": ["구내식당"]
-  },
-  "candidates": [
-    {
-      "category": "단체급식",
-      "taxonomy_path": "식음료 > 급식 > 단체급식",
-      "definition": "기업·학교·병원 등에 단체 식사를 제공하거나 구내식당을 운영",
-      "include": ["위탁급식", "사내식당"],
-      "exclude": ["일반 음식점", "식자재 도매"],
-      "similar_examples": ["아워홈 본사식당", "현대그린푸드 구내식당"]
-    },
-    {
-      "category": "일반 음식점",
-      "taxonomy_path": "식음료 > 음식점",
-      "definition": "일반 소비자를 대상으로 조리 음식을 판매",
-      "similar_examples": ["판교삼성식당"]
-    }
-  ]
-}
-```
+### 3.5 LLM 재분류
 
-#### 권장 출력 제한
-
-```json
-{
-  "selected_category_id": "C102",
-  "alternative_category_id": "C101",
-  "decision": "selected | insufficient_information | review_required",
-  "evidence": ["구내식당", "유사 정답 사례"],
-  "ambiguity_type": "clear | category_boundary | insufficient_name | conflicting_evidence"
-}
-```
-
-LLM이 후보 외 category를 자유 생성하지 못하도록 한다. 예외적으로 정답 누락 탐지를 위해 `none_of_candidates`만 허용한다.
-
-#### 카테고리 정의 생성
-
-Amazon 연구처럼 수기 라벨된 대표 사례를 LLM에 요약시켜 category definition을 생성할 수 있다.
+LLM은 다음 대상에만 사용한다.
 
 ```text
-수기 정답 사례 100~1,000개
-    ↓
-대표 사례 / 하위 군집 샘플링
-    ↓
-LLM category summary 생성
-    ↓
-도메인 담당자 검수
-    ↓
-Versioned Label Card 저장
+필수 대상:
+- 신규 1차 모델 결과가 기타인 가맹점
+
+선택 대상:
+- calibrated confidence가 낮은 가맹점
+- Top-1과 Top-2 margin이 작은 가맹점
+- Rule과 신규 모델이 충돌한 가맹점
+- 신규·미등록 가맹점
+- 특정 long-tail 또는 오류 비용이 큰 category
 ```
 
-정의에는 반드시 다음이 포함되어야 한다.
+권장 흐름:
 
 ```text
-정의
-포함 사례
-제외 사례
-혼동 category
-대표 키워드
-대표 브랜드
-taxonomy path
+신규 1차 모델 예측
+    ↓
+기타 / 저신뢰 / 충돌 대상 추출
+    ↓
+수기 정답 exact match
+    ↓
+Embedding + lexical + model probability 기반 Top-K 검색
+    ↓
+LLM candidate-only reclassification
+    ↓
+자동 반영 / 검수 / 기타 유지
 ```
 
----
+LLM은 다음 중 하나만 반환하도록 제한한다.
 
-### 2.4 Text & Tabular Context Fusion
+```text
+selected
+none_of_candidates
+insufficient_information
+review_required
+```
 
-Two-headed DragoNet 결과에서 merchant name만 사용한 경우 macro/micro F1이 낮았고, business activity를 함께 사용했을 때 성능이 크게 향상되었다. 이는 이름만으로 판단 불가능한 merchant가 많다는 점을 보여준다.
+LLM이 제공한 confidence 숫자를 그대로 사용하지 않고, 검색·모델·룰 신호를 함께 이용해 자동 반영 여부를 판단한다.
 
-#### 권장 피처
+### 3.6 Confidence Calibration과 Routing
 
-| 그룹 | 예시 |
+신규 모델의 softmax probability 또는 margin은 validation set에서 보정해야 한다.
+
+권장 신호:
+
+| 신호 | 역할 |
 |---|---|
-| Text | raw/clean merchant name, transaction description, business activity |
-| Category context | MCC description, rule category, Label Card retrieval result |
-| Numerical | avg/median amount, amount std, night ratio, weekend ratio |
-| Behavioral | repeat ratio, unique customer count, refund ratio |
-| Entity | brand_id, PG flag, online/offline, region |
-| Retrieval | top1 similarity, top1-top2 margin, neighbor purity |
-
-#### 모델 구조
-
-```text
-Text Encoder
-    → text_embedding
-
-MCC / Rule / Brand Embedding
-    → categorical_embedding
-
-Numerical Features
-    → numerical_projection
-
-Retrieval Evidence
-    → retrieval_feature
-
-concat
-    → MLP / Transformer Fusion / LightGBM
-    → category probabilities
-```
-
-#### 추천 비교
-
-```text
-Model A: text only
-Model B: text + MCC
-Model C: text + rule features
-Model D: text + transaction pattern
-Model E: text + retrieval features
-Model F: all features
-```
-
-feature leakage를 피하기 위해 MCC나 rule이 실제 운영 시점에 사용할 수 있는 값인지 확인해야 한다.
-
----
-
-### 2.5 Hierarchical Multi-head / Taxonomy Constraint
-
-가맹점 category가 대분류·중분류·소분류 구조라면 flat classifier만으로는 계층 불일치가 발생한다.
-
-#### 권장 구조
-
-```text
-Shared Encoder
-    ↓
-Major Head
-Middle Head
-Minor Head
-Marketing Category Head(optional)
-    ↓
-Taxonomy Constraint
-```
-
-#### Loss 예시
-
-```text
-L_total =
-    L_major
-  + α × L_middle
-  + β × L_minor
-  + γ × L_marketing
-  + δ × L_hierarchy_consistency
-```
-
-#### Taxonomy-aware 처리 방식
-
-1. **Inference masking**
-
-```text
-예측된 대분류의 하위 category만 소분류 후보로 허용
-```
-
-2. **Hierarchy penalty**
-
-```text
-부모-자식 불일치 확률에 추가 loss 부여
-```
-
-3. **Path classification**
-
-```text
-유효한 taxonomy path 자체를 label로 예측
-```
-
-4. **LLM constrained selection**
-
-```text
-후보에 유효한 path만 제공
-```
-
-#### 평가 지표
-
-```text
-Major / Middle / Minor Macro-F1
-Exact Path Accuracy
-Hierarchy Violation Rate
-Parent Correct but Child Wrong Rate
-Top-K Leaf Recall
-```
-
-Two-headed DragoNet의 Taxonomy-aware Attention은 micro-category F1을 약 1% 개선했으므로, 계층 제약은 단독으로 큰 성능 향상보다 **잘못된 조합 제거와 운영 안정성**에 의미가 있다.
-
----
-
-### 2.6 Weak Supervision / Label Generation
-
-수기 라벨이 부족하거나 long-tail category가 많은 경우 기존 룰과 보조 정보를 약지도 학습에 활용한다.
-
-#### Label Source
-
-| 소스 | 용도 | 예상 신뢰도 |
-|---|---|---:|
-| exact brand rule | positive weak label | 매우 높음 |
-| 정규식/keyword rule | weak label | 중~높음 |
-| MCC mapping | prior / weak label | 중간 |
-| WordNet / synonym | candidate evidence | 중간 이하 |
-| embedding neighbor majority | weak label | similarity 구간별 상이 |
-| LLM agreement label | pseudo-label | 검증 필요 |
-| 사용자/CS 수정 | gold 또는 silver label | 중~높음 |
-| human review | gold label | 높음 |
-
-#### 권장 파이프라인
-
-```text
-1. Labeling Functions 생성
-2. coverage / overlap / conflict 분석
-3. label source별 정확도 추정
-4. probabilistic 또는 hard weak label 생성
-5. gold + weak label 혼합 학습
-6. low-confidence / disagreement human review
-7. 오류 사례를 labeling function 개선에 반영
-```
-
-#### FastText Anchoring 응용
-
-Scalable Weak Supervision 연구는 소수 anchor 단어에서 FastText 유사 단어를 확장해 labeling function coverage를 높인다.
-
-우리 서비스에서는 다음과 같이 활용할 수 있다.
-
-```text
-anchor: 약국
-    → 온누리, 메디팜, pharmacy, pharm, drugstore ...
-
-anchor: 카페
-    → coffee, roastery, espresso, cafe, 커피 ...
-```
-
-다만 유사어 확장은 false positive가 많을 수 있으므로 수기 검수와 word boundary가 필요하다.
-
-#### 주의점
-
-- labeling function이 서로 강하게 상관되면 독립 가정이 깨질 수 있음
-- label model 확률은 calibration되지 않을 수 있음
-- weak label 오류를 DNN이 과적합할 수 있음
-- confidence weighting이 항상 성능 향상을 보장하지 않음
-
-따라서 small gold validation set은 필수다.
-
----
-
-### 2.7 Transaction Pattern / Time-series
-
-가맹점명 정보가 부족한 경우 거래 패턴이 보조 신호가 된다.
-
-| 업종 | 패턴 예시 |
-|---|---|
-| 카페 | 소액, 오전·오후 피크, 높은 재방문 |
-| 주점 | 야간·주말 비중 증가 |
-| 병원 | 평일 주간, 금액 분산 큼 |
-| 구독 | 월 단위 반복, 고정 금액 |
-| 배달 | 점심·저녁 피크 |
-| 편의점 | 소액, 전 시간대 분산 |
-
-#### 추천 feature
-
-```text
-amount: mean, median, std, quantile
-hour: daypart distribution, night ratio
-calendar: weekday/weekend/holiday ratio
-recurrence: fixed amount, cycle score, repeat ratio
-customer: unique users, repeat users, new user ratio
-operation: refund, cancel, online/offline, PG flag
-```
-
-#### 추천 활용
-
-```text
-Text model probability
-    + transaction pattern features
-    → LightGBM / MLP fusion
-```
-
-신규 merchant는 거래 이력이 적으므로 cold-start flag를 별도로 두고 text/embedding 가중치를 높여야 한다.
-
----
-
-### 2.8 Merchant Affinity / Relational Graph
-
-#### 기본 graph
-
-```text
-Node:
-    merchant, brand, user, category, MCC, region, transaction
-
-Edge:
-    user - paid_at - merchant
-    merchant - belongs_to - brand
-    merchant - has_mcc - MCC
-    merchant - located_in - region
-    merchant - labeled_as - category
-    transaction - generated_by - merchant
-```
-
-#### Rel-Cat에서 얻는 구조적 시사점
-
-```text
-1. 거래 문자열용 Txn-Bert 임베딩 생성
-2. 같은 기업/사용자의 과거 거래에서 Top-K NN 검색
-3. 충분히 유사하면 early exit
-4. 그렇지 않으면 heterogeneous GNN으로 category link prediction
-```
-
-QuickBooks 연구에서 Top-K NN은 반복된 historical seen category에 강했지만 unseen category에는 거의 예측력이 없었다. GNN은 unseen subset을 보완했다.
-
-우리 서비스에 대응하면 다음과 같다.
-
-```text
-유사 merchant/brand가 충분함
-    → embedding retrieval 결과로 빠르게 처리
-
-유사 사례가 없거나 category가 분산됨
-    → transaction/brand/MCC/region graph로 보완
-```
-
-#### 적용 우선 조건
-
-- 가맹점·브랜드·MCC·지역·거래 관계가 안정적으로 구축되어 있음
-- text + embedding 모델의 오류가 generic merchant, PG, marketplace에 집중됨
-- graph embedding을 batch로 생성하고 serving할 수 있음
-
-그래프는 초기 MVP보다 중장기 과제로 두는 것이 적절하다.
-
----
-
-### 2.9 Synthetic Data / LLM Teacher / Distillation
-
-LLM이 실제로 높은 분류 효과를 보였다면 LLM 호출 결과를 일회성으로 소비하지 말고 학습 자산으로 전환한다.
-
-#### Teacher-Student 구조
-
-```text
-Gold labels
-    + high-confidence LLM labels
-    + rule/model/LLM agreement labels
-    ↓
-Student model training
-    ↓
-대부분 student가 처리
-    ↓
-불확실한 일부만 LLM 호출
-```
-
-#### LLM pseudo-label 채택 기준
-
-```text
-- 동일 입력 반복 시 결과 일치
-- 서로 다른 prompt에서 결과 일치
-- candidate set 내에서 선택
-- retrieval 근거와 일치
-- category definition과 모순 없음
-- 기존 모델과 LLM이 일치하거나 human 검수 완료
-```
-
-#### 제외 또는 낮은 가중치 대상
-
-```text
-- 실행마다 category 변경
-- none_of_candidates 빈번
-- 입력 정보 부족
-- rule/embedding/LLM이 모두 충돌
-- long-tail인데 유사 근거가 없음
-```
-
-#### Synthetic Data 권장 범위
-
-합성 데이터는 전체 데이터를 대체하지 않고 다음에 제한한다.
-
-```text
-- 신규 category 초기 샘플
-- 철자/언어/지점명 변형
-- PG·결제대행 노이즈 변형
-- hard-negative pair
-- minority category 보강
-```
-
-합성 데이터는 실제 validation/test set과 분리하고, 합성 비율별 ablation을 수행한다.
-
----
-
-### 2.10 Confidence-based Routing and Human Review
-
-최종 운영은 단일 모델 정확도보다 **정확도-coverage-비용 trade-off**를 최적화해야 한다.
-
-#### Confidence 입력
-
-| 신호 | 설명 |
-|---|---|
-| `model_max_probability` | 주 분류 모델 최대 확률 |
-| `entropy` | 예측 분포 불확실성 |
-| `top1_top2_margin` | 1위·2위 차이 |
-| `embedding_top1_similarity` | 가장 유사한 정답 사례 점수 |
-| `neighbor_purity` | 이웃 category 일관성 |
-| `candidate_recall_proxy` | 후보 생성 안정성 |
-| `rule_model_agreement` | 룰과 모델 일치 |
-| `model_llm_agreement` | 주 모델과 LLM 일치 |
-| `new_merchant_flag` | 신규 merchant 여부 |
+| `primary_max_probability` | 신규 모델의 최대 확률 |
+| `primary_entropy` | 예측 분포 불확실성 |
+| `primary_top1_top2_margin` | 상위 후보 간 구분 정도 |
+| `rule_model_agreement` | Rule과 신규 모델의 일치 여부 |
+| `embedding_model_agreement` | 검색 후보와 신규 모델의 일치 여부 |
+| `neighbor_purity` | 유사 정답 사례의 category 일관성 |
+| `candidate_recall_risk` | 후보 생성 실패 가능성 |
+| `new_merchant_flag` | 신규 상호 여부 |
 | `category_risk` | category별 오류 비용 |
 
-#### 별도 Correctness Model
+권장 라우팅:
 
-LLM이 직접 출력한 confidence만 사용하지 말고, 검증 라벨로 다음 확률을 학습한다.
-
-```text
-P(final prediction is correct | all confidence signals)
-```
-
-모델 후보:
-
-```text
-Logistic Regression
-LightGBM
-Calibrated classifier
-```
-
-#### Routing 예시
-
-| 구간 | 예시 조건 | 처리 |
-|---|---|---|
-| Hard auto | exact rule + model/embedding 일치 | 자동 확정 |
-| Model auto | calibrated correctness가 목표 precision 이상 | 자동 확정 |
-| LLM rerank | 후보 Recall이 높고 Top-1 margin이 낮음 | LLM 후보 비교 |
-| Human review | LLM도 불확실하거나 high-risk | 검수 큐 |
-| Unknown | 정보 부족·OOD | 기타/미분류 유지 |
-
-threshold는 고정값을 임의로 정하지 말고 validation set에서 category별 precision 목표에 맞춰 선택한다.
+| 구간 | 액션 |
+|---|---|
+| 고신뢰 + Rule/검색 일치 | 신규 1차 모델 결과 자동 반영 |
+| 중간 신뢰 + 후보 명확 | LLM 재분류 후 조건부 반영 |
+| 저신뢰·충돌 | LLM 재분류 또는 검수 |
+| 정보 부족·후보 누락 | 기타 유지 또는 human review |
 
 ---
 
-## 3. 권장 최종 시스템 아키텍처
+## 4. 1개월 내 구현 가능한 권장 시스템 아키텍처
 
-### 3.1 오프라인 학습·준비 영역
+### 4.1 설계 원칙
+
+- 기존 2023년 모델을 production dependency로 두지 않는다.
+- 신규 학습 파이프라인과 신규 1차 모델을 먼저 재구축한다.
+- 1개월 안에는 batch/shadow 실행을 목표로 한다.
+- LLM은 전체 분류기가 아니라 재분류기로 사용한다.
+- 수기 정답과 Label Card를 후보 검색에 활용한다.
+- 결과·feature·모델·taxonomy·prompt 버전을 모두 저장한다.
+
+### 4.2 학습 파이프라인
 
 ```text
-[Gold / Reviewed Labels]
+[Raw Merchant / Transaction Data]
         |
-        +----------------------------+
-        |                            |
-        v                            v
-[Reference Merchant Index]    [Category Label Cards]
-        |                            |
-        |                     LLM summary + human review
-        |                            |
-        +-------------+--------------+
+        v
+[Dataset Builder]
+    - 기간 snapshot
+    - merchant entity dedup
+    - label source priority
+    - taxonomy version
+    - train/valid/test split
+        |
+        v
+[Feature Builder]
+    - raw / normalized name
+    - char / word n-gram
+    - MCC / rule / brand feature
+    - optional transaction aggregate
+        |
+        +--------------------------+
+        |                          |
+        v                          v
+[Fast Baseline]             [Transformer Challenger]
+- Logistic Regression       - lightweight encoder
+- Linear SVM                - fine-tuning
+        |                          |
+        +-------------+------------+
                       v
-             [Embedding Index]
+             [Evaluation & Selection]
+             - Macro/Weighted F1
+             - long-tail / new merchant
+             - Top-K recall
+             - calibration
+             - latency / cost
                       |
                       v
-[Rule / MCC / WordNet / LLM Pseudo Labels]
-                      |
-                      v
-             [Weak Label Pipeline]
-                      |
-                      v
-[Domain-specific Small Model Training]
-    - SubwordCNN
-    - char n-gram baseline
-    - 4~6 layer Transformer
-    - hierarchical heads
-                      |
-                      v
-             [Calibration Model]
+                [Model Registry]
+             - model artifact
+             - data/config version
+             - metrics/model card
 ```
 
-### 3.2 온라인 또는 대규모 배치 추론 영역
+### 4.3 배치 분류 및 LLM 재분류 파이프라인
 
 ```text
-[Raw Transactions / Merchant Data]
+[New Merchant / Backfill Data]
         |
         v
-[Merchant Entity Deduplication]
-    - merchant_id
-    - normalized merchant
-    - brand cluster
+[Preparation]
+    - normalization result
+    - merchant entity dedup
+    - exact gold / dictionary match
+        |
+        +---- high-precision match ----> [Final Category]
         |
         v
-[Hard Rule Early Exit]
-        |
-        +---- confident match ----> [Final Category]
-        |
-        v
-[Domain Model]
+[New Primary Classifier]
     - category probabilities
+    - Top-K candidates
+    - calibrated confidence
         |
-        +
-[Embedding Retrieval]
-    - similar gold merchants
-    - category Label Cards
-        |
-        +
-[Soft Rule / MCC / Pattern Features]
+        +---- high confidence ----------> [Auto Approval]
         |
         v
-[Candidate Fusion]
-    - Top-K category
-    - retrieval evidence
-    - candidate margin
+[Reclassification Router]
+    - other
+    - low confidence
+    - model-rule conflict
+    - new merchant
         |
         v
-[Correctness / Conflict Checker]
+[Hybrid Retrieval]
+    - labeled merchant index
+    - Category Label Card index
+    - lexical similarity
+    - primary model probability
+    - MCC / rule prior
         |
-        +---- high confidence ----> [Auto Approval]
+        v
+[Top-3~Top-5 Candidate Package]
         |
-        +---- resolvable ambiguity -> [LLM General Expert]
+        v
+[LLM Reclassification]
+    - candidate-only selection
+    - none / insufficient 허용
+    - structured JSON
         |
-        +---- insufficient evidence -> [Human Review / Unknown]
-                                      |
-                                      v
-                              [Feedback Labels]
-                                      |
-                                      v
-                              [Periodic Retraining]
+        v
+[Acceptance Policy]
+    - hierarchy validation
+    - evidence / agreement check
+    - category risk
+       /        |         \
+      /         |          \
+[Accept]   [Human Review]  [Other 유지]
+      \         |          /
+       \        |         /
+        [Versioned Result & Feedback Store]
+                     |
+                     v
+             [Next Training Dataset]
 ```
 
-### 3.3 LLM 호출 단위
+### 4.4 최소 운영 구성요소
 
-1천만 건 원천 거래를 그대로 LLM에 보내지 않는다.
+| 구성요소 | 최소 기능 |
+|---|---|
+| Dataset Builder | 날짜·taxonomy·label source가 고정된 학습 데이터 생성 |
+| Training CLI / Job | config 기반 재학습과 seed 고정 |
+| Evaluation Report | 전체·category·subset별 성능 및 confusion matrix |
+| Model Registry | artifact, metrics, data version, code commit 저장 |
+| Batch Inference | 재실행 가능한 idempotent job |
+| Retrieval Index | 수기 정답·Label Card 버전 관리 |
+| LLM Batch Module | retry, JSON validation, cache, token/cost log |
+| Result Store | model·taxonomy·prompt 버전과 근거 저장 |
+| Monitoring | category 분포, 기타율, confidence, disagreement, drift |
+
+### 4.5 대규모 처리 원칙
+
+1천만 거래 레코드를 직접 분류하거나 LLM에 보내지 않는다.
 
 ```text
-원천 거래 10,000,000건
-    ↓ merchant_id / normalized name 중복 제거
+원천 거래 1천만 건
+    ↓ merchant_id / normalized merchant 기준 집계
 고유 merchant entity
-    ↓ brand/branch clustering
-대표 merchant unit
-    ↓ rule/model/embedding routing
-실제 LLM 호출 대상만 선별
+    ↓ exact match / cache 제거
+신규 또는 재분류 대상 entity
+    ↓ 신규 primary model
+기타·저신뢰·충돌 entity만 LLM
 ```
 
-동일 가맹점명·동일 후보 집합에 대한 LLM 결과는 cache한다.
+권장 캐시 키:
+
+```text
+normalized_merchant_name
++ MCC(optional)
++ candidate_set_hash
++ taxonomy_version
++ primary_model_version
++ prompt_version
++ llm_model_version
+```
 
 ---
 
-## 4. 우리 서비스 관점의 적용 우선순위
+## 5. 신규 모델 학습 데이터 설계
 
-현재 다음 요소가 있다고 가정한다.
+### 5.1 Label Source Priority
 
 ```text
-- SubwordCNN 기반 분류 모델
-- WordNet 기반 유사어/동의어 매칭
-- 룰 기반 분류
-- 수기 라벨 데이터
-- MCC 및 merchant normalization 정비 계획
-- LLM 재분류의 유의미한 효과 확인
+Priority 1. 최근 수기 검수 완료 정답
+Priority 2. 명확한 브랜드·사업자 기준 gold mapping
+Priority 3. 사용자/운영팀 수정 결과
+Priority 4. 검수된 고신뢰 LLM 결과
+Priority 5. 고정밀 rule weak label
+Priority 6. 기존 2023년 모델 예측은 label로 사용하지 않음
 ```
 
-현재 LLM의 분류 효과가 확인되었으므로 LLM을 단순한 최후순위 fallback으로만 두지 않는다. 다만 전체 건을 LLM으로 직접 처리하는 구조도 권장하지 않는다. 임베딩·도메인 모델이 생성한 Top-K 후보를 재순위화하고, 고품질 pseudo-label과 오프라인 의미 임베딩을 생성하며, 저신뢰 사례만 보정하도록 역할을 분리한다. 이를 반영한 모델링 우선순위는 다음과 같다.
+기존 모델 예측을 새 모델의 정답으로 사용하면 과거 오류를 그대로 학습할 수 있으므로 feature나 비교 신호로만 제한한다.
 
-| 우선순위 | 추천 접근 | 이유 | 난이도 |
-|---:|---|---|---:|
-| 1 | **평가셋·오류 유형·비용 지표 정비** | 이후 모든 실험의 기준. 신규/long-tail/기타/충돌 subset 분리 필요 | 낮음~중간 |
-| 2 | **Embedding Top-K 후보 검색** | 수기 정답을 직접 활용하며 LLM 자유도를 줄이고 Recall@K를 높임 | 중간 |
-| 3 | **Dual-Expert LLM reranking** | 이미 확인된 LLM 효과를 비용 효율적으로 확대 | 중간 |
-| 4 | **Confidence / correctness routing** | 자동 승인, LLM, human review를 분리해 운영 위험 통제 | 중간 |
-| 5 | **도메인 특화 소형 Transformer 실험** | Better with Less와 Rel-Cat이 제시한 비용·속도·도메인 적합성 검증 | 중간 |
-| 6 | **LLM Teacher / Distillation** | 반복 LLM 호출을 student model로 이전 | 중간~높음 |
-| 7 | **Hierarchical Multi-head + taxonomy constraint** | 대·중·소분류 일관성과 long-tail 개선 | 중간 |
-| 8 | **Text + Transaction Feature Fusion** | 이름만으로 불가능한 merchant 보완 | 중간~높음 |
-| 9 | **Weak Supervision Pipeline** | 기존 룰/WordNet/MCC/LLM을 학습 데이터로 전환 | 중간 |
-| 10 | **Merchant Affinity / Relational GNN** | generic/PG/marketplace 및 unseen 보완 | 높음 |
+### 5.2 Split 원칙
 
-## 5. 추천 실험 설계
+단순 random row split은 동일 가맹점·브랜드가 train과 test에 동시에 포함되는 leakage를 만들 수 있다.
 
-### 5.1 평가 데이터 구성
+권장 split:
 
-무작위 test set 하나만으로는 충분하지 않다.
+```text
+- merchant_id 또는 normalized merchant group 단위 분리
+- 가능하면 시간 기반 out-of-time test 추가
+- 동일 brand의 지점이 양쪽에 섞이는지 별도 확인
+- 신규 merchant subset 별도 유지
+- long-tail category와 기타 재분류 subset 별도 유지
+```
 
-| 평가 subset | 목적 |
+### 5.3 필수 평가 subset
+
+| Subset | 목적 |
 |---|---|
-| Random holdout | 전체 평균 성능 |
-| Time-based holdout | 신규 시점 일반화 |
-| New merchant | cold-start 성능 |
-| Long-tail category | 소수 category 성능 |
-| Other-to-category | 기존 기타 재분류 정확도 |
-| Rule-model conflict | 하이브리드 판단 성능 |
-| Similar category pairs | 경계 category 구분 |
-| Generic merchant names | 이름 정보 부족 대응 |
-| PG / marketplace | payment intermediary 처리 |
-| High-volume merchant | 사업 영향도가 큰 사례 |
+| Random Merchant | 전체 평균 성능 |
+| Out-of-time Merchant | 최신 분포 일반화 |
+| New Merchant | 신규 상호 대응 |
+| Long-tail Category | 희소 category 성능 |
+| Existing Other with Gold | 기타 감소 가능성 |
+| Similar Category Pair | 미세 경계 구분 |
+| Generic Name | 이름 정보 부족 대응 |
+| PG / Marketplace | 실제 seller 정보 부재 오류 |
+| Rule–Model Conflict | 하이브리드 라우팅 평가 |
+| High-volume Merchant | 사업 영향이 큰 오류 평가 |
 
-### 5.2 Baseline / Small Model 실험
+---
+
+## 6. 실험 설계
+
+### 6.1 신규 1차 모델 실험
 
 ```text
-B0. Existing SubwordCNN
-B1. char n-gram + Linear SVM
-B2. char n-gram + Logistic Regression
-B3. fastText
-B4. DistilBERT fine-tuning
-B5. 4-layer custom Transformer
-B6. 6-layer custom Transformer
-B7. Student model trained with LLM pseudo-labels
+P0. 기존 2023년 SubwordCNN/ML 결과 재평가 가능한 범위의 legacy baseline
+P1. char n-gram TF-IDF + Logistic Regression
+P2. char n-gram TF-IDF + Linear SVM
+P3. P1/P2 probability + MCC/rule feature LightGBM
+P4. lightweight Transformer text-only
+P5. lightweight Transformer + MCC/rule context
+P6. P3와 P5 stacking 또는 champion-challenger 비교
 ```
 
-평가:
+1개월 MVP의 champion은 가장 복잡한 모델이 아니라 다음 조건을 만족하는 모델로 선정한다.
 
 ```text
-Accuracy / Macro-F1 / Weighted-F1
-Long-tail F1
-New merchant F1
-1M records latency and cost
-Model size / memory
+- 신규·out-of-time 성능이 안정적임
+- category별 편차가 수용 가능함
+- confidence calibration이 가능함
+- 대량 batch 추론 비용이 적정함
+- 재학습과 배포를 다른 담당자가 재현할 수 있음
 ```
 
-### 5.3 Embedding Retrieval 실험
+### 6.2 LLM 재분류 실험
 
 ```text
-R0. lexical only: char TF-IDF / BM25
-R1. multilingual sentence embedding
-R2. BGE/E5 계열 dense embedding
-R3. domain fine-tuned embedding
+L0. 가맹점명 + 전체 category 목록을 이용한 direct LLM
+L1. 신규 primary Top-K + LLM
+L2. Embedding Top-K + LLM
+L3. Primary + embedding + lexical + MCC/rule Top-K + LLM
+L4. L3 + Category Label Card
+L5. L4 + 유사 수기 정답 사례
+L6. L5 + hard-negative / 혼동 사례
+L7. L6 + acceptance routing
+```
+
+### 6.3 임베딩 검색 실험
+
+```text
+R0. char TF-IDF / lexical only
+R1. multilingual dense embedding
+R2. raw name + normalized name embedding
+R3. merchant reference + Label Card dual index
 R4. dense + lexical hybrid
-R5. hybrid + MCC/rule prior
-R6. LLM-generated semantic initialization model
-```
-
-검색 단위 비교:
-
-```text
-merchant raw name
-merchant raw + normalized name
-merchant + MCC description
-merchant + business activity
-merchant + transaction context
+R5. R4 + primary model probability + MCC/rule prior
 ```
 
 평가:
 
 ```text
-Recall@3 / Recall@5 / Recall@10
+Recall@3 / Recall@5
 MRR
-Neighbor purity
-Candidate miss rate
-Search latency
-Index size
+Candidate Miss Rate
+Neighbor Purity
+New Merchant Recall@5
+Long-tail Recall@5
+검색 latency / index size
 ```
 
-### 5.4 Dual-Expert 실험
+### 6.4 End-to-end 평가 지표
 
-```text
-D0. Current LLM direct classification
-D1. Model Top-5 + LLM selection
-D2. Embedding Top-5 + LLM selection
-D3. Rule + Model + Embedding Top-5 + LLM selection
-D4. D3 + Label Card
-D5. D4 + similar positive examples
-D6. D5 + hard-negative examples
-D7. D6 + none_of_candidates
-```
-
-K 비교:
-
-```text
-K = 3, 5, 10
-```
-
-평가:
-
-```text
-Candidate Recall@K
-LLM conditional accuracy given gold in candidates
-End-to-end accuracy
-Long-tail accuracy
-Candidate miss recovery rate
-Average input tokens
-Cost per 1M unique merchants
-P50 / P95 latency
-Repeat prediction consistency
-```
-
-중요한 분해 지표:
-
-```text
-End-to-end error =
-    candidate generator miss
-  + LLM reranking error
-  + routing error
-```
-
-### 5.5 LLM Embedding Initialization 실험
-
-```text
-I0. Random embedding initialization
-I1. Learned category index embedding
-I2. General sentence embedding initialization
-I3. LLM-generated Label Card embedding initialization
-I4. LLM-generated MCC + merchant + category initialization
-```
-
-각 설정에서 embedding을 다음처럼 비교한다.
-
-```text
-frozen
-trainable
-partial fine-tuning
-```
-
-### 5.6 Hierarchical Multi-head 실험
-
-```text
-H0. Flat minor-category classifier
-H1. Major + Minor multi-head
-H2. Major + Middle + Minor multi-head
-H3. H2 + hierarchy penalty
-H4. H2 + inference mask
-H5. H2 + LLM path reranking
-```
-
-평가:
-
-```text
-Major/Middle/Minor Macro-F1
-Exact Path Accuracy
-Hierarchy Violation Rate
-Top-K Leaf Recall
-```
-
-### 5.7 Weak Supervision 실험
-
-```text
-W0. Gold only
-W1. Rule weak labels only
-W2. Gold + rule weak labels
-W3. Gold + rule + MCC + WordNet
-W4. W3 + embedding pseudo-label
-W5. W4 + LLM pseudo-label
-W6. W5 + source confidence weighting
-```
-
-반드시 다음을 기록한다.
-
-```text
-label source coverage
-label source empirical accuracy
-source conflict rate
-category별 noise rate
-```
-
-### 5.8 Confidence Routing 실험
-
-```text
-C0. max softmax only
-C1. temperature scaling
-C2. model + embedding signals
-C3. model + embedding + rule agreement
-C4. C3 + LLM agreement
-C5. LightGBM correctness model
-```
-
-평가:
-
-```text
-Coverage @ target precision
-Error Rate @ Auto-approved
-Risk-Coverage curve
-ECE / Brier score
-LLM call reduction
-Human review reduction
-Cost per correct classification
-```
-
-### 5.9 Scale 실험
-
-```text
-- 원천 건수 vs 고유 merchant 수
-- deduplication ratio
-- embedding batch throughput
-- exact search vs ANN Recall@K
-- LLM cache hit ratio
-- category별 처리 시간
-- 재처리 필요 비율
-```
-
----
-
-## 6. 모델 선택 및 운영 판단 기준
-
-### 6.1 작은 모델과 LLM의 역할 분리
-
-**Better with Less**의 결과를 그대로 가맹점 category 분류에 일반화할 수는 없지만, 다음 가설은 충분히 검증할 가치가 있다.
-
-```text
-가설:
-가맹점명/거래명처럼 제한된 도메인 문자열은
-대형 범용 LLM보다 작은 도메인 모델이
-비슷한 정확도와 훨씬 낮은 비용을 달성할 수 있다.
-```
-
-따라서 운영 모델 선택은 다음처럼 한다.
-
-| 상황 | 우선 모델 |
+| 영역 | 지표 |
 |---|---|
-| 규칙적으로 반복되는 상호 | rule / dictionary |
-| 수기 정답과 유사한 신규 지점 | embedding retrieval |
-| 패턴이 학습된 일반 merchant | small domain classifier |
-| 후보 간 의미 차이가 미세함 | LLM reranker |
-| 정보가 부족하거나 충돌함 | human review / unknown |
-| 관계 정보가 풍부하고 text가 모호함 | graph / relational model |
+| 1차 모델 | Accuracy, Macro-F1, Weighted-F1, category F1 |
+| 일반화 | Out-of-time F1, New Merchant F1, long-tail F1 |
+| 후보 생성 | Recall@K, MRR, candidate miss rate |
+| Confidence | ECE, Brier score, risk–coverage, top1-top2 margin |
+| LLM | Conditional accuracy, repeat consistency, none rate |
+| 운영 | Auto-approval precision, coverage, review rate, other reduction |
+| 비용 | 고유 가맹점당 추론 비용, LLM 호출률, token 비용 |
+| 성능 | Batch throughput, P50/P95 latency, cache hit rate |
 
-### 6.2 LLM이 특히 유리한 사례
-
-```text
-- category 이름이 의미적으로 겹침
-- taxonomy path를 이해해야 함
-- 소수 category에 학습 데이터가 적음
-- 기존 라벨에 노이즈가 있음
-- 상호명에서 업종을 상식적으로 추론할 수 있음
-- 후보별 포함·제외 기준 비교가 필요함
-```
-
-### 6.3 LLM이 불리한 사례
+오류는 반드시 다음처럼 분해한다.
 
 ```text
-- 상호명이 정보가 없는 고유명사
-- 실제 사업 내용이 이름과 다름
-- PG/marketplace가 실제 seller를 가림
-- category 후보에 정답이 없음
-- 최신 로컬 사업체 정보가 필요함
-- 수천만 건을 반복 처리해야 함
-```
-
-이런 사례에는 거래 패턴, 관계 정보, 외부 사업자 정보 또는 human review가 필요하다.
-
----
-
-## 7. 단계별 구현 로드맵
-
-### Phase 1: 4~8주 — 후보 검색 + Dual-Expert MVP
-
-```text
-1. 수기 정답 merchant reference index 구축
-2. Category Label Card 작성
-3. dense + lexical hybrid retrieval
-4. Top-5 candidate 생성
-5. LLM candidate-only reranking
-6. current LLM direct 방식과 A/B 비교
-```
-
-성공 조건 예시:
-
-```text
-Recall@5가 충분히 높음
-현재 direct LLM 대비 정확도 유지 또는 향상
-토큰/비용 감소
-잘못된 category 자유 생성 감소
-```
-
-### Phase 2: 4~8주 — Confidence Routing
-
-```text
-1. confidence feature 저장
-2. correctness model 학습
-3. auto / LLM / human review 구간 분리
-4. category별 threshold 최적화
-5. risk-coverage dashboard 구축
-```
-
-### Phase 3: 6~12주 — Small Domain Model / Distillation
-
-```text
-1. 4~6 layer Transformer 학습
-2. LLM high-confidence pseudo-label 추가
-3. hard-negative contrastive learning
-4. student model과 LLM 성능·비용 비교
-5. LLM 호출 비율 축소
-```
-
-### Phase 4: 8~16주 — Hierarchical / Feature Fusion
-
-```text
-1. major/middle/minor multi-head
-2. taxonomy constraint
-3. MCC / transaction pattern fusion
-4. new merchant / long-tail 개선
-```
-
-### Phase 5: 중장기 — Graph / Relational Deep Learning
-
-```text
-1. merchant-brand-MCC-region graph
-2. merchant similarity edge
-3. graph embedding feature
-4. Top-K retrieval early exit + GNN cascade
+1. Label / taxonomy 오류
+2. Primary classifier 오류
+3. Candidate retrieval miss
+4. LLM candidate selection 오류
+5. Acceptance / routing 오류
+6. 가맹점명만으로 판단 불가능한 사례
 ```
 
 ---
 
-## 8. 최종 제안
+## 7. 1개월 단계별 구현 로드맵
 
-현재 상황에서 가장 현실적인 목표 구조는 다음과 같다.
+### 7.1 전제와 현실적인 완료 범위
+
+1개월은 타이트하지만 다음 수준의 MVP는 가능하다.
 
 ```text
-Rule / Dictionary Early Exit
-    ↓
-Domain-specific Small Classifier
-    + Embedding Retrieval
-    + MCC / Rule / Pattern Features
-    ↓
-Top-K Candidate Generator
-    ↓
-High confidence → Auto Approval
-Ambiguous but resolvable → LLM General Expert
-Insufficient / high risk → Human Review or Unknown
-    ↓
-Reviewed labels + LLM labels → Student Retraining
+가능:
+- 재현 가능한 데이터셋·학습·평가 파이프라인
+- 최소 2개 이상의 신규 1차 모델 baseline
+- 신규 모델 champion 또는 shadow candidate 선정
+- 기타·저신뢰 대상 LLM 재분류 모듈
+- 과거 데이터 일부 backfill / shadow run
+
+1개월 내 보장하기 어려움:
+- 모든 category의 완전한 라벨 정비
+- GNN·거래 시계열·대규모 weak supervision
+- 실시간 production serving과 완전 자동 전환
+- 신규 Transformer의 장기 안정성 검증
 ```
 
-핵심 제안은 다음과 같다.
+### 7.2 1주차 — 데이터·평가·재현 환경 복구
 
-1. **임베딩은 최종 분류기보다 Top-K 후보 검색기로 우선 사용한다.**
-2. **LLM은 전체 taxonomy 자유 선택보다 후보 재순위화에 사용한다.**
-3. **카테고리명만 주지 말고 taxonomy path와 Label Card를 제공한다.**
-4. **LLM의 의미 지식은 오프라인 임베딩 초기화와 distillation으로 경량 모델에 이전한다.**
-5. **대규모 운영의 주 모델은 도메인 특화 소형 Transformer를 포함해 비교한다.**
-6. **룰·MCC·WordNet·LLM 결과는 약지도 라벨 소스로 재활용한다.**
-7. **accuracy만이 아니라 Recall@K, coverage, 자동 승인 오류율, 비용을 함께 최적화한다.**
-8. **merchant name만으로 판단 불가능한 케이스는 transaction pattern과 graph로 분리 대응한다.**
+#### 목표
 
-초기 운영 구조인 다음 조합:
+기존 담당자나 과거 코드에 의존하지 않는 데이터 및 학습 기반을 만든다.
+
+#### 구현
 
 ```text
-SubwordCNN
-+ Text & Tabular Fusion
-+ Hierarchical Classification
-+ Weak Supervision
-+ Confidence Routing
-+ LLM Fallback
+1. 최근 기간의 merchant·transaction·label source를 추출
+2. 수기 정답, rule 결과, 기존 모델 결과의 source와 날짜를 구분
+3. merchant entity와 normalized merchant 기준을 확정
+4. taxonomy version과 label priority를 정의
+5. group/time-aware train/validation/test split 구현
+6. 공통 평가 subset과 지표 구현
+7. 학습 configuration, random seed, artifact 저장 구조 생성
+8. 기존 2023년 모델 결과를 동일 test set에서 가능한 범위로 평가
 ```
 
-은 임베딩 검색과 LLM의 역할을 포함해 다음 구조로 확장하는 것이 적절하다.
+#### 산출물
 
 ```text
-Rule / Dictionary
-+ Domain-specific Small Transformer
-+ Embedding Top-K Retrieval
-+ Dual-Expert LLM Reranking
-+ Hierarchical / Feature Fusion
-+ Confidence Routing
-+ LLM Teacher / Offline Semantic Initialization
-+ Transaction Pattern / Relational Graph
+- Dataset Builder SQL / code
+- versioned train/valid/test dataset
+- label quality report
+- legacy model baseline report
+- training/evaluation repository skeleton
+- environment / dependency file
+- model artifact naming convention
+```
+
+#### 완료 기준
+
+```text
+동일 snapshot과 config로 데이터와 평가 결과를 재생성할 수 있음
+기존 모델의 실제 현재 성능과 주요 오분류 유형을 파악함
+```
+
+### 7.3 2주차 — 신규 1차 분류 모델 개발
+
+#### 목표
+
+낮은 위험으로 재학습 가능한 baseline과 성능 challenger를 확보한다.
+
+#### 구현
+
+```text
+1. char n-gram Logistic Regression 학습
+2. char n-gram Linear SVM 또는 fastText 계열 비교
+3. MCC/rule/brand feature를 결합한 LightGBM fusion 실험
+4. 가능하면 경량 Transformer fine-tuning을 병렬 수행
+5. category imbalance 처리와 class weight 실험
+6. probability calibration 적용
+7. 모델별 오류·비용·처리량 비교
+```
+
+#### 산출물
+
+```text
+- 최소 2개 신규 모델 artifact
+- 재현 가능한 training command
+- category/subset별 평가 리포트
+- calibrated confidence output
+- primary champion 및 challenger 후보
+```
+
+#### 완료 기준
+
+```text
+기존 2023년 모델보다 최근 test set에서 명확히 개선됨
+또는 최소한 재현성과 유지보수성을 확보하면서 유사한 성능을 달성함
+Top-K category probability를 안정적으로 생성할 수 있음
+```
+
+### 7.4 3주차 — 임베딩 후보 검색과 LLM 재분류 통합
+
+#### 목표
+
+신규 1차 모델이 놓치는 기타·저신뢰 사례를 LLM이 안전하게 재분류하도록 한다.
+
+#### 구현
+
+```text
+1. 수기 정답 Merchant Reference Index 구축
+2. Category Label Card 작성 및 embedding 생성
+3. Dense + lexical + primary probability hybrid Top-K 구현
+4. Candidate-only LLM prompt 및 JSON schema 구현
+5. none_of_candidates / insufficient_information 처리
+6. direct LLM 대비 성능·비용 비교
+7. 자동 반영 / 검수 / 기타 유지 정책 구현
+8. prompt/model/taxonomy version과 cache 저장
+```
+
+#### 산출물
+
+```text
+- Hybrid Retrieval 모듈
+- LLM batch reclassification module
+- Candidate Recall@K 리포트
+- LLM end-to-end 재분류 리포트
+- acceptance routing policy
+```
+
+#### 완료 기준
+
+```text
+기타·저신뢰 gold subset에서 신규 1차 모델 단독 대비 성능이 개선됨
+자동 반영 구간의 precision이 사전 합의한 기준을 충족함
+후보 밖 category 생성과 형식 오류가 통제됨
+```
+
+### 7.5 4주차 — 통합 배치·Shadow 검증 및 인수 가능 상태 정리
+
+#### 목표
+
+다른 담당자가 운영·재학습할 수 있는 통합 MVP를 만든다.
+
+#### 구현
+
+```text
+1. 전처리 → 신규 primary → routing → retrieval → LLM → 결과 저장 연결
+2. 과거 데이터 일부 backfill 및 최근 데이터 shadow run
+3. batch idempotency, retry, cache, failure recovery 확인
+4. category 분포·기타율·confidence drift 모니터링 구현
+5. 운영 threshold와 rollback 기준 확정
+6. 코드·데이터·모델·prompt 인수 문서 작성
+7. 다음 재학습 주기와 owner 역할 정의
+```
+
+#### 산출물
+
+```text
+- End-to-end batch MVP
+- 신규 primary model과 model card
+- LLM 재분류 결과 table
+- shadow/backfill 성능·비용 리포트
+- retraining runbook
+- 운영·장애·rollback 가이드
+- 미해결 오류와 2개월차 backlog
+```
+
+#### 완료 기준
+
+```text
+기존 모델 파이프라인 없이 신규 데이터부터 결과까지 재현 가능함
+신규 모델과 LLM 결과를 버전별로 추적할 수 있음
+production 반영 전 shadow 판단에 필요한 정확도·비용·안정성 근거가 있음
 ```
 
 ---
 
-## 9. 참고 링크
+## 8. 적용 우선순위
+
+| 우선순위 | 항목 | 1개월 역할 | 판단 |
+|---:|---|---|---|
+| 1 | Dataset Builder와 label/version 정의 | 모든 모델 개발의 기반 | 필수 |
+| 2 | Train/validation/test 및 평가 파이프라인 | 재현성과 비교 가능성 확보 | 필수 |
+| 3 | Char n-gram 신규 baseline | 빠르고 안정적인 primary 후보 | 필수 |
+| 4 | MCC/rule feature fusion | 이름 기반 한계 보완 | 필수 또는 우선 |
+| 5 | 경량 Transformer challenger | 의미 일반화 성능 검증 | 병렬 권장 |
+| 6 | Confidence calibration과 routing | 자동 처리와 재분류 구간 분리 | 필수 |
+| 7 | Merchant·Label Card embedding index | LLM 후보 검색 | 필수 |
+| 8 | Candidate-only LLM 재분류 | 기타·저신뢰 보정 | 필수 |
+| 9 | Batch·registry·monitoring·runbook | 담당자 변경에도 운영 가능 | 필수 |
+| 10 | Transaction pattern / weak supervision / distillation | MVP 결과 기반 후속 고도화 | 후속 |
+| 11 | Relational GNN | 잔여 오류가 관계 정보 부족일 때 검토 | 장기 선택 |
+
+---
+
+## 9. 운영 정책과 모니터링
+
+### 9.1 Model / Data Version
+
+최소한 다음 값을 모든 결과에 저장한다.
+
+```yaml
+dataset_snapshot_date: date
+label_version: string
+taxonomy_version: string
+feature_version: string
+primary_model_name: string
+primary_model_version: string
+calibration_version: string
+retrieval_index_version: string
+prompt_version: string
+llm_model_version: string
+inference_run_id: string
+```
+
+### 9.2 결과 저장 스키마
+
+```yaml
+merchant_id: string
+raw_merchant_name: string
+normalized_merchant_name: string
+mcc: string | null
+rule_category_id: string | null
+rule_score: float | null
+legacy_category_id: string | null
+primary_category_id: string
+primary_topk: array
+primary_confidence: float
+primary_entropy: float
+routing_reason: string
+retrieval_candidates: array
+neighbor_purity: float | null
+candidate_margin: float | null
+llm_selected_category_id: string | null
+llm_decision: string | null
+final_category_id: string
+final_decision_source: string
+review_status: string
+model_version: string
+taxonomy_version: string
+prompt_version: string | null
+created_at: timestamp
+```
+
+### 9.3 필수 모니터링
+
+```text
+- category 분포와 기타 비율
+- 신규 merchant 비율
+- 평균 confidence / entropy / margin
+- Rule–primary disagreement 비율
+- LLM routing 비율과 accepted 비율
+- human review 정답률
+- category별 precision 표본
+- input text 길이·문자 유형·MCC 분포 drift
+- 모델 version별 처리량·실패율·비용
+```
+
+### 9.4 재학습 주기
+
+초기에는 고정 주기보다 조건 기반 재학습이 적합하다.
+
+```text
+- 최근 검수 gold label이 일정량 이상 축적됨
+- 기타율 또는 신규 merchant 비율이 기준 이상 증가함
+- 주요 category precision이 하락함
+- 신규 브랜드·결제 표현이 대규모로 유입됨
+- taxonomy가 변경됨
+```
+
+안정화 이후 월 1회 또는 분기 1회 정기 재학습과 drift-triggered 재학습을 결합할 수 있다.
+
+---
+
+## 10. 리스크와 대응
+
+| 리스크 | 영향 | 대응 |
+|---|---|---|
+| 수기 정답 라벨이 오래되었거나 충돌 | 신규 모델이 잘못된 정답을 학습 | label source/date 저장, 충돌 제거, 표본 검수 |
+| 기존 모델 예측을 정답으로 재사용 | 과거 오류가 신규 모델에 전파 | legacy output은 label로 사용하지 않음 |
+| 동일 브랜드 leakage | test 성능 과대평가 | merchant/brand group split과 out-of-time test |
+| 1개월 내 Transformer 안정화 실패 | 전체 일정 지연 | char n-gram + fusion을 guaranteed baseline으로 유지 |
+| LLM이 후보 밖 지식을 생성 | 잘못된 자동 반영 | candidate-only schema, none/insufficient 허용 |
+| 임베딩 후보에 정답이 없음 | LLM 선택 한계 | Recall@K를 별도 최적화하고 candidate miss 추적 |
+| 기타 감소율만 강조 | 오분류 증가 | auto-approved precision과 risk–coverage를 핵심 기준으로 사용 |
+| 담당자 변경 후 다시 파이프라인 유실 | 유지보수 불가 | repository, config, registry, runbook, owner 정의를 완료 기준에 포함 |
+| 1천만 건 LLM 비용 | 비용·처리시간 증가 | merchant entity dedup, exact match, primary routing, cache 적용 |
+
+---
+
+## 11. 1개월 이후 권장 확장
+
+1개월 MVP 결과를 기반으로 다음 순서로 확장한다.
+
+```text
+1. 신규 primary 모델 production shadow 기간 연장 및 threshold 안정화
+2. 기타 외 low-confidence·conflict 대상의 LLM routing 확대
+3. 거래 금액·시간대·반복성 feature 추가
+4. 검수·LLM 결과를 이용한 weak supervision 또는 student distillation
+5. Hierarchical multi-head classifier 개발
+6. category별 threshold와 correctness model 학습
+7. PG·marketplace·generic 상호 잔여 오류가 크면 relational graph 검토
+```
+
+### 11.1 2개월차에 우선할 항목
+
+```text
+- 신규 모델과 legacy 결과의 장기간 shadow 비교
+- 검수 feedback UI 또는 batch review workflow
+- transaction aggregate feature fusion
+- 자동 재학습 job과 model promotion gate
+- LLM 비용 최적화와 repeated pattern의 rule/student 흡수
+```
+
+---
+
+## 12. 최종 제안
+
+### 12.1 권장 의사결정
+
+1. **기존 2023년 SubwordCNN/ML 모델은 유지 대상이 아니라 교체 대상이다.** 학습 파이프라인이 없고 현재 오분류가 많으므로 legacy baseline으로만 사용한다.
+2. **1개월의 최우선 과제는 신규 모델 자체보다 재현 가능한 학습·평가·배포 파이프라인을 복구하는 것이다.**
+3. **신규 1차 모델은 char n-gram 기반 저비용 baseline과 경량 Transformer challenger를 병렬 개발한다.** 일정 리스크를 줄이면서 성능 개선 가능성을 확인할 수 있다.
+4. **MCC·Rule·브랜드 신호를 fusion feature로 활용한다.** 기존 룰과 모델을 경쟁 관계가 아니라 보완 신호로 사용한다.
+5. **LLM을 재분류 용도로 사용하는 제안은 타당하다.** 신규 1차 모델의 기타·저신뢰·충돌 사례에 한정하는 것이 비용과 안정성 면에서 최적이다.
+6. **임베딩은 LLM 앞단의 후보 검색기로 사용한다.** 수기 정답 사례와 Category Label Card를 검색해 후보를 좁힌다.
+7. **1개월 완료 목표는 production 전면 전환이 아니라 end-to-end batch MVP와 shadow 판단 근거다.** 완전 자동화는 정확도·비용·검수 결과를 확인한 뒤 진행한다.
+8. **모든 검수·LLM 재분류 결과는 다음 재학습 데이터로 축적한다.** 시간이 지날수록 LLM 호출을 경량 모델로 흡수하는 구조가 바람직하다.
+
+### 12.2 한 줄 요약
+
+```text
+기존 2023년 모델을 유지한 채 LLM만 붙이는 것이 아니라,
+1개월 동안 재현 가능한 신규 1차 모델 파이프라인을 다시 만들고
+기타·저신뢰 결과만 임베딩 후보 검색과 LLM으로 재분류하는 구조가 최적이다.
+```
+
+---
+
+## 13. 참고 링크
 
 ### Research Papers
 
-- [E-commerce Product Categorization with LLM-based Dual-Expert Classification Paradigm](https://www.amazon.science/publications/e-commerce-product-categorization-with-llm-based-dual-expert-classification-paradigm)
-- [Better with Less: Small Proprietary Models Surpass Large Language Models in Financial Transaction Understanding](https://arxiv.org/abs/2509.25803)
-- [Hierarchical Classification of Financial Transactions Through Context-Fusion of Transformer-based Embeddings and Taxonomy-aware Attention Layer](https://arxiv.org/abs/2312.07730)
-- [Transaction Categorization with Relational Deep Learning in QuickBooks](https://arxiv.org/abs/2506.09234)
-- [Scalable and Weakly Supervised Bank Transaction Classification](https://arxiv.org/abs/2305.18430)
-- [Enhancing Foundation Models in Transaction Understanding with LLM-based Sentence Embeddings](https://aclanthology.org/2025.emnlp-industry.61/)
 - [Merchant Category Identification Using Credit Card Transactions](https://arxiv.org/abs/2011.02602)
-- [Building Payment Classification Models from Rules and Crowdsourced Labels](https://lepo.it.da.ut.ee/~dumas/pubs/caise2018PaymentClassification.pdf)
-- [Identifying Banking Transaction Descriptions via SVM Short-Text Classification](https://arxiv.org/abs/2404.08664)
+- [Building Payment Classification Models from Rules and Crowdsourced Labels: A Case Study](https://link.springer.com/chapter/10.1007/978-3-319-92898-2_7)
+- [Scalable and Weakly Supervised Bank Transaction Classification](https://arxiv.org/abs/2305.18430)
+- [Hierarchical Classification of Financial Transactions Through Context-Fusion of Transformer-based Embeddings and Taxonomy-aware Attention Layer](https://arxiv.org/abs/2312.07730)
+- [Identifying Banking Transaction Descriptions via Support Vector Machine Short-Text Classification Based on a Specialized Labelled Corpus](https://arxiv.org/abs/2404.08664)
+- [E-commerce Product Categorization with LLM-based Dual-Expert Classification Paradigm](https://www.amazon.science/publications/e-commerce-product-categorization-with-llm-based-dual-expert-classification-paradigm)
+- [Transaction Categorization with Relational Deep Learning in QuickBooks](https://arxiv.org/abs/2506.09234)
 - [Categorising SME Bank Transactions with Machine Learning and Synthetic Data Generation](https://arxiv.org/abs/2508.05425)
+- [Better with Less: Small Proprietary Models Surpass Large Language Models in Financial Transaction Understanding](https://arxiv.org/abs/2509.25803)
+- [Enhancing Foundation Models in Transaction Understanding with LLM-based Sentence Embeddings](https://aclanthology.org/2025.emnlp-industry.61/)
 
 ### Industry / Product References
 
 - [Plaid Enrich](https://plaid.com/products/enrich/)
-- [Plaid Enrich API Docs](https://plaid.com/docs/api/products/enrich/)
+- [Plaid Enrich API](https://plaid.com/docs/api/products/enrich/)
 - [Yodlee Transaction Data Enrichment](https://developer.yodlee.com/resources/yodlee/transaction-data-enrichment/docs)
+- [Yodlee Retail Transaction Enrichment](https://developer.yodlee.com/resources/yodlee/transaction-data-enrichment/docs/retail-category)
+- [Yodlee Business Transaction Enrichment](https://developer.yodlee.com/resources/yodlee/transaction-data-enrichment/docs/business-category)
 - [Salt Edge Data Enrichment](https://www.saltedge.com/products/data_enrichment)
+- [Salt Edge Data Enrichment Docs](https://docs.saltedge.com/data_enrichment/v5/)
+- [QuickBooks AI-powered Banking](https://quickbooks.intuit.com/learn-support/en-us/help-article/matching-rules/learn-updates-new-ai-powered-banking-page/L0hR7A9Zf_US_en_US)
 
 ---
 
-## 부록 A. 최소 권장 LLM Prompt 구조
+## 부록 A. 최소 권장 Repository 구조
+
+```text
+merchant-category-classification/
+├── configs/
+│   ├── data.yaml
+│   ├── train_char_ngram.yaml
+│   ├── train_transformer.yaml
+│   └── inference.yaml
+├── sql/
+│   ├── build_merchant_snapshot.sql
+│   └── build_labels.sql
+├── src/
+│   ├── data/
+│   │   ├── build_dataset.py
+│   │   ├── split.py
+│   │   └── validation.py
+│   ├── features/
+│   │   ├── text_features.py
+│   │   └── tabular_features.py
+│   ├── models/
+│   │   ├── train_linear.py
+│   │   ├── train_transformer.py
+│   │   ├── calibrate.py
+│   │   └── evaluate.py
+│   ├── retrieval/
+│   │   ├── build_index.py
+│   │   └── search.py
+│   ├── llm/
+│   │   ├── prompt.py
+│   │   ├── batch_reclassify.py
+│   │   └── schema.py
+│   └── pipeline/
+│       ├── batch_inference.py
+│       └── routing.py
+├── tests/
+├── notebooks/
+├── model_cards/
+├── requirements.txt 또는 pyproject.toml
+└── README.md
+```
+
+## 부록 B. 최소 권장 LLM 재분류 Prompt
 
 ```text
 System:
-너는 가맹점 카테고리 taxonomy를 따르는 분류 전문가다.
-반드시 제공된 후보 중 하나를 선택하거나 none_of_candidates를 반환한다.
-상호명에 없는 사실을 임의로 생성하지 않는다.
+너는 제공된 내부 가맹점 카테고리 taxonomy를 따르는 재분류 전문가다.
+입력은 신규 1차 분류 모델에서 기타·저신뢰·충돌로 판단된 가맹점이다.
+반드시 제공된 후보 중 하나를 선택하거나
+none_of_candidates / insufficient_information / review_required를 반환한다.
+상호명과 제공 근거에 없는 사업 정보를 임의로 생성하지 않는다.
 
 Input:
 - 원본 가맹점명
 - 정규화 가맹점명
-- MCC와 설명
-- 룰 근거
-- 후보 category Top-K
+- MCC 및 설명(optional)
+- Rule 결과와 근거(optional)
+- 신규 1차 모델 Top-K와 calibrated confidence
+- 임베딩·lexical 결합 후보 Top-K
 - 후보별 taxonomy path
-- 후보별 정의 / 포함 / 제외
+- 후보별 definition / include / exclude
 - 유사 수기 정답 사례
-- 혼동 사례
+- 혼동 사례(optional)
 
 Output JSON:
 - selected_category_id
@@ -1352,29 +1102,19 @@ Output JSON:
 - review_required
 ```
 
-## 부록 B. 최소 권장 저장 스키마
+## 부록 C. 1개월 MVP 완료 체크리스트
 
-```yaml
-merchant_id: string
-raw_merchant_name: string
-normalized_merchant_name: string
-brand_id: string | null
-rule_category_id: string | null
-rule_score: float
-model_top1_category_id: string
-model_top1_probability: float
-model_top2_category_id: string
-model_margin: float
-embedding_top1_similarity: float
-neighbor_purity: float
-candidate_categories: array
-llm_selected_category_id: string | null
-llm_decision: string | null
-final_category_id: string
-final_correctness_probability: float
-routing_action: auto | llm | review | unknown
-model_version: string
-embedding_version: string
-label_card_version: string
-prompt_version: string
+```text
+[ ] 최근 snapshot 기반 versioned dataset 생성 가능
+[ ] merchant/group/time-aware split 재현 가능
+[ ] 신규 char n-gram baseline 학습 가능
+[ ] 경량 Transformer challenger 결과 확인
+[ ] 신규 모델 calibration 및 Top-K 출력 가능
+[ ] 수기 정답·Label Card retrieval index 생성 가능
+[ ] Candidate-only LLM batch 실행 가능
+[ ] 자동 반영 / 검수 / 기타 유지 routing 가능
+[ ] batch 재실행과 cache/idempotency 확인
+[ ] model/data/taxonomy/prompt version 저장
+[ ] model card와 retraining runbook 작성
+[ ] shadow/backfill 평가 리포트 완료
 ```
