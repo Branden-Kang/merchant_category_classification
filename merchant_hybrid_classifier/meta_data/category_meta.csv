@@ -1,0 +1,6 @@
+fine_label,fine_name,mid_label,mid_name,top_label,top_name,store_category_cd
+0,카페,0,카페,0,음식,C000
+1,한식,1,한식,0,음식,C001
+2,편의점,2,편의점,1,소매,C002
+3,약국,3,약국,2,의료,C003
+4,의류,4,의류,1,소매,C004
