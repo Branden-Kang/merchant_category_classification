@@ -1,4 +1,4 @@
-# 보수적 분류용
+# 보수적 가맹점명 카테고리 분류용
 ```
 You are a merchant category classification expert.
 
